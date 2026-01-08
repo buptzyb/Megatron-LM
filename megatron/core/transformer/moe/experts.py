@@ -665,19 +665,28 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = tokens_per_expert.long().cpu().tolist()
 
         actual_tokens_per_expert = tokens_per_expert
-        if self.config.fp8 or self.config.fp4:
-            if self.config.moe_use_device_initiated_grouped_gemm:
-                assert self.config.moe_router_padding_for_quantization, "Should set --moe-router-padding-for-quantization to use router padding for fp8 when enabled device-initiated grouped gemm."
-                permuted_probs = permuted_probs.unsqueeze(-1)
-            else:
-                permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
-                    permuted_local_hidden_states, tokens_per_expert
-                )
-                permuted_probs, _ = self.quantization_padding(
-                    permuted_probs.unsqueeze(-1), actual_tokens_per_expert
-                )
+        if (
+            self.config.fp8 or self.config.fp4
+        ) and self.config.moe_flex_dispatcher_backend != "hybridep":
+            # Without hybridep, we need to do manual padding for FP8 tensor before grouped gemm.
+            permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+            permuted_probs, _ = self.quantization_padding(
+                permuted_probs.unsqueeze(-1), actual_tokens_per_expert
+            )
         else:
             permuted_probs = permuted_probs.unsqueeze(-1)
+
+        permuted_local_hidden_states = permuted_local_hidden_states.contiguous()
+        received_num_tokens = permuted_local_hidden_states.shape[0]
+        if (
+            self.config.moe_received_token_capacity is not None
+            and not self.config.moe_use_device_initiated_grouped_gemm
+        ):
+            # Without device-initiated grouped gemm, we need to make sure the tensor size dones't exceed sum of tokens_per_expert.
+            permuted_local_hidden_states = permuted_local_hidden_states[: sum(tokens_per_expert)]
+            permuted_probs = permuted_probs[: sum(tokens_per_expert)]
 
         if self.config.moe_apply_probs_on_input:
             assert (
@@ -773,6 +782,23 @@ class TEGroupedMLP(MegatronModule):
         output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
+        else:
+            if (
+                self.config.moe_received_token_capacity is not None
+                and not self.config.moe_use_device_initiated_grouped_gemm
+            ):
+                output = torch.cat(
+                    [
+                        output,
+                        torch.zeros(
+                            received_num_tokens - output.shape[0],
+                            output.shape[1],
+                            dtype=output.dtype,
+                            device=output.device,
+                        ),
+                    ],
+                    dim=0,
+                )
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
@@ -783,11 +809,10 @@ class TEGroupedMLP(MegatronModule):
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
-        if self.config.fp8 or self.config.fp4:
-            if self.config.moe_use_device_initiated_grouped_gemm:
-                assert self.config.moe_router_padding_for_quantization, "Should set --moe-router-padding-for-quantization to use router padding for fp8 when enabled device-initiated grouped gemm."
-            else:
-                output = self.quantization_unpadding(output, actual_tokens_per_expert)
+        if (
+            self.config.fp8 or self.config.fp4
+        ) and self.config.moe_flex_dispatcher_backend != "hybridep":
+            output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
         output_bias = None
 

@@ -994,6 +994,7 @@ class _HybridEPManager(_DispatchManager):
         self.handle = None
         # Used for padding the output for each expert
         self.pad_multiple = None
+        self.received_token_capacity = config.moe_received_token_capacity
 
         if hybrid_ep_dispatch is None:
             raise ImportError(
@@ -1020,6 +1021,14 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = torch.full(
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
+        elif self.received_token_capacity is not None:
+            self.num_dispatched_tokens = int(
+                self.received_token_capacity * num_tokens * self.config.moe_router_topk
+            )
+            self.num_permuted_tokens = self.num_dispatched_tokens
+        else:
+            self.num_dispatched_tokens = None
+            self.num_permuted_tokens = None
 
     def dispatch(
         self,
@@ -1052,8 +1061,9 @@ class _HybridEPManager(_DispatchManager):
 
         if not self.drop_and_pad:
             self.tokens_per_expert = tokens_per_expert
-            # self.num_permuted_tokens is necessary to allocate the output tensor for permute
-            self.num_permuted_tokens = self.tokens_per_expert.sum()
+            if self.received_token_capacity is None:
+                # self.num_permuted_tokens is necessary to allocate the output tensor for permute
+                self.num_permuted_tokens = self.tokens_per_expert.sum()
 
         return dispatched_hidden
 
@@ -1073,7 +1083,7 @@ class _HybridEPManager(_DispatchManager):
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
         # num_dispatched_tokens, because their values never change.
         self.handle = None
-        if not self.drop_and_pad:
+        if not self.drop_and_pad and self.received_token_capacity is None:
             self.num_permuted_tokens = None
         return hidden_states
 

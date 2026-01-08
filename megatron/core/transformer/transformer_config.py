@@ -699,6 +699,9 @@ class TransformerConfig(ModelParallelConfig):
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
     the MNNVL case."""
 
+    moe_received_token_capacity: Optional[float] = None
+    """The capacity of total received tokens on each ep rank."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -1794,9 +1797,13 @@ class TransformerConfig(ModelParallelConfig):
                     self.moe_expert_capacity_factor is None
                     or not self.moe_pad_expert_input_to_capacity
                 ):
-                    assert (
-                        CudaGraphScope.moe not in self.cuda_graph_scope
-                    ), 'moe cuda graph is only supported with drop-padding MoE.'
+                    if CudaGraphScope.moe not in self.cuda_graph_scope:
+                        assert (
+                            self.moe_token_dispatcher_type == 'flex'
+                            and self.moe_flex_dispatcher_backend == 'hybridep'
+                            and self.moe_received_token_capacity is not None
+                            and self.moe_use_device_initiated_grouped_gemm
+                        ), 'moe cuda graph is only supported with sync-free MoE.'
                     if self.moe_token_dispatcher_type == 'alltoall' and (
                         self.moe_expert_capacity_factor is not None
                         or self.moe_router_padding_for_fp8
