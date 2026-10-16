@@ -255,8 +255,9 @@ def _assert_similar(actual: torch.Tensor, expected: torch.Tensor, *, label: str,
 )
 @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("stash", ["used", "declined"])
+@pytest.mark.parametrize("score_bound", [False, True], ids=["unbounded", "chunked"])
 def test_checkpoint_replay_reuses_first_call_topk(
-    tp, cp, deterministic, stash, indexer_call_log, monkeypatch
+    tp, cp, deterministic, stash, score_bound, indexer_call_log, monkeypatch
 ):
     _skip_if_cudnn_dsa_unavailable(tp * cp)
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
@@ -288,6 +289,10 @@ def test_checkpoint_replay_reuses_first_call_topk(
                 dsa_cudnn_kernels, "run_fused_qk_topk_with_scores", lambda **_kwargs: None
             )
         config.dsa_indexer_reuse_checkpoint_topk = True
+        if score_bound:
+            # About 32 query rows of the 128-row local pack per scorer launch, so the first
+            # call's stored top-k comes from several chunked launches.
+            config.dsa_indexer_score_chunk_max_gb = 32 * 128 * cp * 4 / (1 << 30)
         reused = _checkpointed_step(attention, inputs, grad_output_seed=7)
 
         if stash == "used":

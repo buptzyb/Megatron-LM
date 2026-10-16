@@ -408,6 +408,18 @@ class TransformerConfig(ModelParallelConfig):
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
     """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
 
+    dsa_indexer_score_chunk_max_gb: Optional[float] = None
+    """Upper bound, in GiB, on the FP32 score buffer of one cuDNN DSA indexer scorer launch.
+
+    The cuDNN backend materializes ``[query rows, key prefix]`` FP32 indexer scores before
+    Top-K. When set, the Top-K scoring paths (no indexer loss and the sparse indexer loss) split
+    query rows so that one launch stays within this bound, including packed THD layouts that
+    otherwise score the whole local pack in one launch. The dense indexer loss returns the full
+    score matrix and is not bounded (a warning says so). Chunked launches need a cuDNN frontend
+    that accepts ``q_causal_offsets``; older frontends keep their default launches and warn.
+    ``None`` keeps packed THD scoring in one launch and bounds the other Top-K paths with a
+    built-in budget."""
+
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
 
@@ -2203,6 +2215,14 @@ class TransformerConfig(ModelParallelConfig):
                         "sharing and requires dsa_indexer_topk_freq > 1, got "
                         f"{self.dsa_indexer_topk_freq}."
                     )
+            if (
+                self.dsa_indexer_score_chunk_max_gb is not None
+                and self.dsa_indexer_score_chunk_max_gb <= 0
+            ):
+                raise ValueError(
+                    "dsa_indexer_score_chunk_max_gb must be positive when set, got "
+                    f"{self.dsa_indexer_score_chunk_max_gb}."
+                )
             if has_context_parallelism:
                 cp_comm_types = (
                     self.cp_comm_type

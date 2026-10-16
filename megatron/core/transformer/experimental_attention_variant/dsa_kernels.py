@@ -133,6 +133,33 @@ def _deterministic_dsa_requested(config: TransformerConfig) -> bool:
     )
 
 
+def _indexer_score_chunk_max_bytes(config: TransformerConfig) -> Optional[int]:
+    """Return the configured bound on one indexer scorer launch's score buffer, in bytes."""
+    max_gb = getattr(config, "dsa_indexer_score_chunk_max_gb", None)
+    if max_gb is None:
+        return None
+    return max(1, int(max_gb * (1 << 30)))
+
+
+def _indexer_hook_kwargs(
+    fn, config: TransformerConfig, *, deterministic: bool = True, extra: Optional[dict] = None
+) -> dict:
+    """Optional, signature-filtered indexer kwargs shared by the fused DSA hooks.
+
+    The score chunk bound is offered only when configured, so unset configs keep the
+    hooks' existing call contract. ``extra`` adds hook-specific optional kwargs.
+    """
+    candidates = dict(extra or {})
+    if deterministic:
+        candidates["deterministic"] = _deterministic_dsa_requested(config)
+    score_chunk_max_bytes = _indexer_score_chunk_max_bytes(config)
+    if score_chunk_max_bytes is not None:
+        candidates["indexer_score_chunk_max_bytes"] = score_chunk_max_bytes
+    if not candidates:
+        return {}
+    return filter_kwargs_for_callable(fn, candidates)
+
+
 def run_fused_qk_topk(
     config: TransformerConfig,
     q: Tensor,
@@ -182,7 +209,7 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
+        **_indexer_hook_kwargs(fn, config),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
@@ -247,15 +274,7 @@ def run_fused_qk_topk_with_scores(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        **filter_kwargs_for_callable(
-            fn,
-            {
-                "deterministic": _deterministic_dsa_requested(config),
-                "query": query,
-                "key": key,
-                "config": config,
-            },
-        ),
+        **_indexer_hook_kwargs(fn, config, extra={"query": query, "key": key, "config": config}),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
@@ -378,7 +397,7 @@ def run_fused_qk_topk_with_loss(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
-        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
+        **_indexer_hook_kwargs(fn, config),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
@@ -513,6 +532,7 @@ def run_fused_dsa_attention(
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         pg_collection=pg_collection,
+        **_indexer_hook_kwargs(fn, config, deterministic=False),
     )
     if result is None:
         _log_declined_hook(config, "run_fused_dsa_attention", "backend returned None")

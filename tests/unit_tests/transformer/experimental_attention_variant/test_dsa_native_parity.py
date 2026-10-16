@@ -1394,11 +1394,15 @@ def test_cudnn_indexer_topk_incompatible_packed_boundaries_fall_back(monkeypatch
         @staticmethod
         def indexer_forward_wrapper(q, k, weights, ratio, sm_scale, **packed_kwargs):
             del weights, ratio, sm_scale
-            assert not packed_kwargs
+            # Bounds-masked scoring covers every key column: no THD metadata, and a causal
+            # offset that places all keys inside the in-kernel limit.
+            assert set(packed_kwargs) == {"q_causal_offsets"}
+            assert packed_kwargs["q_causal_offsets"].tolist() == [k.size(1)] * q.size(0)
             return {
                 "scores": torch.arange(k.size(1), dtype=torch.float32)
                 .view(1, 1, -1)
                 .expand(q.size(0), q.size(1), -1)
+                .clone()
             }
 
         @staticmethod
@@ -1854,8 +1858,14 @@ def test_cudnn_indexer_topk_single_packed_cp_prefix_crops_keys_per_chunk(monkeyp
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_alignment(monkeypatch):
+    """One-row score launches keep each row's absolute (bottom-right) causal prefix.
+
+    Frontends with ``q_causal_offsets`` size launches with ``_indexer_score_launch_rows``;
+    older ones use ``_indexer_score_chunk_rows``. Force one row either way.
+    """
     _skip_if_fused_dsa_unavailable()
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_score_chunk_rows", lambda *_args: 1)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_score_launch_rows", lambda rows, **_k: 1)
 
     query = torch.zeros((1, 4, 32, 128), device="cuda", dtype=torch.bfloat16)
     query[..., 0, 0] = 1

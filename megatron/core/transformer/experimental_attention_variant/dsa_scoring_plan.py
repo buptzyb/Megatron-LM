@@ -45,7 +45,9 @@ class IndexerScoringPlan(Enum):
     Current cases are non-packed context parallelism, non-causal or otherwise
     non-reconstructible bounds, and packed causal layouts for which neither the segment
     specialization nor compatible general-THD metadata is available. This set can shrink
-    as fused scorer coverage expands; scoring currently falls back to the per-head loop.
+    as fused scorer coverage expands. The cuDNN backend scores every key column with its
+    dense scorer and applies the bounds as a mask; frontends without per-segment Q offsets
+    fall back to the per-head loop.
     """
 
     DECLINE = "decline"
@@ -196,8 +198,8 @@ def report_unfused_scoring_once(decision: IndexerScoringDecision, context: str) 
     _REPORTED_UNFUSED.add(key)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     message = (
-        f"DSA indexer scoring falls back to the unfused per-head loop ({context}, "
-        f"rank {rank}): {decision.reason}."
+        f"DSA indexer scoring falls back to an unfused executor ({context}, rank {rank}): "
+        f"{decision.reason}."
     )
     # Deliberately not rank-0-only: with heterogeneous packs a non-zero rank can sit
     # on the unfused cliff while rank 0 stays fused, which is exactly the silent case

@@ -104,6 +104,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_reuse_checkpoint_topk": False,
     "dsa_indexer_rope_interleaved": False,
     "dsa_indexer_rotate_activation": True,
+    "dsa_indexer_score_chunk_max_gb": None,
     "dsa_indexer_scoring_relu": True,
     "dsa_indexer_weights_proj_output_dtype": "bf16",
     "dsa_indexer_skip_topk_offset": 0,
