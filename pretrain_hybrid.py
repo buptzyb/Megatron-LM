@@ -418,22 +418,23 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif args.sequence_packing_scheduler is not None:
-        # The scheduler sends packing metadata to middle PP stages itself and requires that
-        # only the first and last stages hold a data iterator.
-        return is_first_or_last_pipeline_stage(vp_stage)
-    elif is_packed_sequence or (
-        # NOTE(nightly-sync 26_10_2026): restored dev-only disjunct, the second half of the
-        # same dropped feature as needs_padding_mask in get_batch above. Main's DCP V2
-        # rewrite (ea99fdfce) kept only `is_packed_sequence`, which leaves middle PP stages
-        # without a data iterator -- but varlen SBHD validation needs its padding metadata
-        # on every stage, and dev's
-        # tests/unit_tests/data/test_get_batch.py::
-        # test_hybrid_sbhd_validation_broadcasts_padding_mask_on_all_pp_stages asserts
-        # exactly that (is_dataset_built_on_rank() == (tp_rank == 0) under TP2 x PP4).
-        getattr(args, 'use_varlen_dataset', False)
-        and getattr(args, 'varlen_sbhd_validation', False)
+    elif (
+        is_packed_sequence
+        or args.sequence_packing_scheduler is not None
+        or (
+            # NOTE(nightly-sync 26_10_2026): restored dev-only disjunct, the second half of the
+            # same dropped feature as needs_padding_mask in get_batch above. Main's DCP V2
+            # rewrite (ea99fdfce) kept only `is_packed_sequence`, which leaves middle PP stages
+            # without a data iterator -- but varlen SBHD validation needs its padding metadata
+            # on every stage, and dev's
+            # tests/unit_tests/data/test_get_batch.py::
+            # test_hybrid_sbhd_validation_broadcasts_padding_mask_on_all_pp_stages asserts
+            # exactly that (is_dataset_built_on_rank() == (tp_rank == 0) under TP2 x PP4).
+            getattr(args, 'use_varlen_dataset', False)
+            and getattr(args, 'varlen_sbhd_validation', False)
+        )
     ):
+        # The sequence-packing scheduler runs on every PP stage and reads its input there.
         # Every PP stage needs its padding metadata, even without packed THD inputs.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
