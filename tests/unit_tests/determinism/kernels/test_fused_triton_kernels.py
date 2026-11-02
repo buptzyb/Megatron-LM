@@ -16,7 +16,8 @@
   first call chose.
 * mHC hyper-connection kernels (``fused_mhc_kernels``): Sinkhorn, h-aggregate and h-post-BDA
   contain real ``tl.sum`` reductions under autotune, on the Triton, native (``torch.compile``)
-  and, when available, cuTile backends.
+  and, when available, cuTile backends; plus one ``HyperConnectionModule`` step through the
+  operations each selection binds (unfused, all operations, or ``mhc_fused_ops``).
 """
 
 import contextlib
@@ -34,9 +35,14 @@ from megatron.core.fusions.fused_row_copy import contiguous_rows
 from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
     fused_csa_teacher_lse,
 )
-from megatron.core.transformer.hyper_connection import native_h_aggregate_into
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    native_h_aggregate_into,
+)
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     bytes_equal,
     seeded,
@@ -707,4 +713,56 @@ def test_native_mhc_dtype_casts_replay_fwd_bwd(eps_inside_sqrt):
         (projection_input.to(torch.bfloat16).detach().requires_grad_(True), projection_weight),
         replays=3,
         what="eager mHC proj_rms with BF16 saved input",
+    )
+
+
+_MHC_GLM_FLAGS = dict(
+    mhc_norm_eps_inside_sqrt=True,
+    mhc_normalize_before_projection=True,
+    mhc_keep_pre_in_fp32=True,
+    mhc_preserve_activation_dtype_rounding=True,
+)
+_MHC_MODULE_PROFILES = {
+    "unfused_glm": _MHC_GLM_FLAGS,
+    "all_ops": dict(use_fused_mhc=True),
+    "per_op_fmk": dict(use_fused_mhc=True, mhc_fused_ops=["proj_rms", "h_aggregate", "h_post_bda"]),
+    "per_op_glm": dict(
+        use_fused_mhc=True, mhc_fused_ops=["proj_rms", "sinkhorn"], **_MHC_GLM_FLAGS
+    ),
+}
+
+
+@pytest.mark.parametrize("profile", list(_MHC_MODULE_PROFILES))
+def test_mhc_module_bound_ops_replay_fwd_bwd(profile):
+    """One mHC module step replays bit-exactly through whatever the module bound.
+
+    The selection (``use_fused_mhc`` alone, ``mhc_fused_ops`` or the unfused GLM flags) decides
+    which operations run, so the replay covers each profile's binding, including any per-op
+    implementation that the binding adds later.
+    """
+    seeded()
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_hyper_connections=True,
+        **_MHC_MODULE_PROFILES[profile],
+    )
+    hyper_connection = HyperConnectionModule(config, 1).cuda()
+
+    class Step(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hyper_connection = hyper_connection
+
+        def forward(self, x):
+            aggregated, h_res, h_post, residual = self.hyper_connection(x, return_residual=True)
+            # A copy of the aggregate stands in for the attention or MLP output.
+            return self.hyper_connection.fused_h_res_h_post_bda(
+                h_res, residual, h_post, (aggregated * 1.0, None), 0.0, True, False
+            )
+
+    x = _mhc_rand(128, 2, 4 * 128)
+    assert_module_replays_bit_exact(
+        Step(), (x,), replays=3, contention=True, what=f"mHC module[{profile}]"
     )
