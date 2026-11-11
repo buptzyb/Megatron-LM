@@ -215,16 +215,27 @@ def run_kpool_pool_topk(
     query_runs: Optional[Tuple[Tuple[int, int, int], ...]],
     hf_scoring: bool,
     use_relu: bool = True,
-) -> Optional[Tensor]:
+    return_scores: bool = False,
+) -> Optional[Union[Tensor, Tuple[Tensor, Optional[Tensor]]]]:
     """Optional fused KPool pool selection (``dsa_indexer_kpool_scorer_backend='cudnn'``).
 
     Returns ``[b, sq, pool_topk]`` int64 pool ids with ``-1`` for unused slots, or None when
     the backend has no such hook or declines the call; the caller then keeps the PyTorch
     KPool scorer. See ``dsa_cudnn_kernels.run_kpool_pool_topk`` for the contract.
+
+    With ``return_scores=True`` a backend result is ``(pool_ids, pool_scores)``, the FP32
+    selector score of each selected pool aligned with its id. A hook that takes no
+    ``return_scores`` argument is called as without it, and its ids come back with ``None``
+    scores.
     """
     fn = _resolve_fused_hook(config, "run_kpool_pool_topk")
     if fn is None:
         return None
+    optional_kwargs = {"deterministic": _deterministic_dsa_requested(config), "config": config}
+    if return_scores:
+        # Offered only when requested, so the frozen selector's call is unchanged.
+        optional_kwargs["return_scores"] = True
+    hook_kwargs = filter_kwargs_for_callable(fn, optional_kwargs)
     result = fn(
         q=q,
         k_pooled=k_pooled,
@@ -234,12 +245,114 @@ def run_kpool_pool_topk(
         query_runs=query_runs,
         hf_scoring=hf_scoring,
         use_relu=use_relu,
-        **filter_kwargs_for_callable(
-            fn, {"deterministic": _deterministic_dsa_requested(config), "config": config}
-        ),
+        **hook_kwargs,
     )
     if result is None:
         _log_declined_hook(config, "run_kpool_pool_topk", "backend returned None")
+        return None
+    if return_scores and "return_scores" not in hook_kwargs:
+        return result, None
+    return result
+
+
+def kpool_sparse_indexer_loss_decline_reason(
+    config: TransformerConfig, query: Tensor, key: Tensor
+) -> Optional[str]:
+    """Why the backend cannot run the trainable KPool loss of this forward, or None if it can.
+
+    The backend's ``kpool_sparse_indexer_loss_decline_reason`` hook decides from host facts
+    (see ``dsa_cudnn_kernels``); a backend without the hook cannot run it.
+    """
+    fn = _resolve_fused_hook(config, "kpool_sparse_indexer_loss_decline_reason")
+    if fn is None:
+        return (
+            f"DSA kernel backend {_get_dsa_kernel_backend(config)!r} has no fused KPool "
+            "indexer loss"
+        )
+    return fn(
+        query=query,
+        key=key,
+        v_channels=int(getattr(config, "kv_lora_rank", 0) or 0),
+        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
+    )
+
+
+def run_kpool_attention_token_target(
+    config: TransformerConfig,
+    query: Tensor,
+    key: Tensor,
+    lse: Tensor,
+    token_topk: Tensor,
+    softmax_scale: float,
+) -> Tensor:
+    """Main-attention mass of each attended KPool token slot, from the backend's kernel.
+
+    Returns FP32 ``[b, sq, width]``: per row, the head-summed attention probability of each
+    slot of ``token_topk`` divided by the local head count, zero at ``-1`` slots. ``lse`` is
+    the fused sparse attention's own LSE over those ids. See
+    ``dsa_cudnn_kernels.run_kpool_attention_token_target``. The caller chose the fused KPool
+    loss for this forward, so a missing hook or a declined call raises.
+    """
+    fn = _resolve_fused_hook(config, "run_kpool_attention_token_target")
+    if fn is None:
+        raise RuntimeError(
+            f"DSA kernel backend {_get_dsa_kernel_backend(config)!r} has no "
+            "run_kpool_attention_token_target hook for the fused KPool indexer loss."
+        )
+    result = fn(query=query, key=key, lse=lse, token_topk=token_topk, softmax_scale=softmax_scale)
+    if result is None:
+        raise RuntimeError(
+            f"DSA kernel backend {_get_dsa_kernel_backend(config)!r} declined the KPool "
+            "attention target of a forward that chose the fused KPool indexer loss."
+        )
+    return result
+
+
+def run_kpool_sparse_indexer_loss(
+    config: TransformerConfig,
+    q: Tensor,
+    weights: Tensor,
+    k_pooled: Tensor,
+    pool_ids: Tensor,
+    pool_scores: Tensor,
+    target: Tensor,
+    row_mask: Tensor,
+    row_count: Union[float, Tensor],
+    loss_coeff: float,
+    hf_scoring: bool,
+    use_relu: bool = True,
+) -> Tensor:
+    """The trainable KPool indexer loss on the backend's kernels, graph-connected to ``q``,
+    ``weights`` and ``k_pooled``.
+
+    See ``dsa_cudnn_kernels.run_kpool_sparse_indexer_loss``. The caller chose the fused KPool
+    loss for this forward, so a missing hook or a declined call raises.
+    """
+    fn = _resolve_fused_hook(config, "run_kpool_sparse_indexer_loss")
+    if fn is None:
+        raise RuntimeError(
+            f"DSA kernel backend {_get_dsa_kernel_backend(config)!r} has no "
+            "run_kpool_sparse_indexer_loss hook for the fused KPool indexer loss."
+        )
+    result = fn(
+        q=q,
+        weights=weights,
+        k_pooled=k_pooled,
+        pool_ids=pool_ids,
+        pool_scores=pool_scores,
+        target=target,
+        row_mask=row_mask,
+        row_count=row_count,
+        loss_coeff=loss_coeff,
+        hf_scoring=hf_scoring,
+        use_relu=use_relu,
+        **filter_kwargs_for_callable(fn, {"deterministic": _deterministic_dsa_requested(config)}),
+    )
+    if result is None:
+        raise RuntimeError(
+            f"DSA kernel backend {_get_dsa_kernel_backend(config)!r} declined the KPool "
+            "indexer loss of a forward that chose the fused KPool indexer loss."
+        )
     return result
 
 

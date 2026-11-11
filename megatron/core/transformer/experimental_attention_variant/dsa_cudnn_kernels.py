@@ -3606,7 +3606,8 @@ def run_kpool_pool_topk(
     use_relu: bool = True,
     deterministic: bool = False,
     config: Optional["TransformerConfig"] = None,
-) -> Optional[Tensor]:
+    return_scores: bool = False,
+) -> Optional[Union[Tensor, Tuple[Tensor, Tensor]]]:
     """Select KPool pools with the cuDNN indexer kernel at ``ratio=pool_size``.
 
     ``q`` is ``[sq, b, h, d]`` (after any rotation), ``k_pooled`` the compressed keys
@@ -3628,17 +3629,31 @@ def run_kpool_pool_topk(
     Returns ``[b, sq, pool_topk]`` int64 pool ids in the top-k kernel's slot order (not by
     score) with ``-1`` for unused slots, or None (warned once per reason) when the call is not
     supported, so the caller keeps the PyTorch scorer.
+
+    With ``return_scores`` it returns ``(pool_ids, pool_scores)`` instead: ``pool_scores`` is
+    FP32 ``[b, sq, pool_topk]``, aligned slot for slot with ``pool_ids`` and ``-inf`` at its
+    ``-1`` slots, and holds the selector's score of each selected pool, the student of the
+    trainable KPool loss. The values are read from the kernel's score buffer at the selected
+    ids, so the top-k launch, and with it the selection, is the same with or without
+    ``return_scores``. With ``hf_scoring`` they carry the HF factor ``(heads * head_dim)**-0.5``
+    that selection drops, so they equal ``sum_h weights_h * relu(q_h . k * head_dim**-0.5)``;
+    otherwise they are the kernel's ``sum_h weights_h * relu(q_h . k)`` as they are.
     """
     reason = _kpool_pool_topk_decline_reason(q, k_pooled, weights, query_runs, use_relu, hf_scoring)
     if reason is not None:
         _log_kpool_decline_once(reason)
         return None
-    sq, b, heads, _head_dim = q.shape
+    sq, b, heads, head_dim = q.shape
     num_pools = k_pooled.size(0)
     device = q.device
     pool_ids = torch.full((b, sq, pool_topk), -1, dtype=torch.int64, device=device)
+    pool_scores = (
+        torch.full((b, sq, pool_topk), float("-inf"), dtype=torch.float32, device=device)
+        if return_scores
+        else None
+    )
     if sq == 0 or num_pools == 0 or pool_topk == 0:
-        return pool_ids
+        return (pool_ids, pool_scores) if return_scores else pool_ids
 
     q_bshd = q.permute(1, 0, 2, 3)
     k_bshd = k_pooled.permute(1, 0, 2).unsqueeze(2)
@@ -3704,8 +3719,9 @@ def run_kpool_pool_topk(
                 (positions // pool_size).clamp(max=n_keys).to(torch.int32).repeat(b).contiguous()
             )
             select_k = min(pool_topk, n_keys)
+            scores_flat = scores.reshape(b * n_rows, n_keys + pad).contiguous()
             selected = _indexer_top_k_wrapper_chunked(
-                scores.reshape(b * n_rows, n_keys + pad).contiguous(),
+                scores_flat,
                 seq_lens,
                 topk_k=select_k,
                 return_topk_scores=False,
@@ -3713,10 +3729,20 @@ def run_kpool_pool_topk(
                 topk_backend=options.topk_backend,
                 topk_scratch_bytes=options.topk_scratch_bytes,
             )["indices"]
-            del scores
+            if return_scores:
+                # The selected values, read where the top-k found them; -inf at unused slots.
+                chosen = selected.to(torch.int64)
+                values = torch.gather(scores_flat, 1, chosen.clamp_min(0)).float()
+                values = values.masked_fill(chosen < 0, float("-inf"))
+                pool_scores[:, row_start:row_end, :select_k] = values.view(b, n_rows, select_k)
+                del chosen, values
+            del scores, scores_flat
             pool_ids[:, row_start:row_end, :select_k] = selected.view(b, n_rows, select_k).to(
                 torch.int64
             )
+    if return_scores and hf_scoring:
+        # Restore the uniform HF factor that selection drops (see above).
+        pool_scores.mul_((heads * head_dim) ** -0.5)
     global _KPOOL_FUSED_SELECTION_LOGGED
     if not _KPOOL_FUSED_SELECTION_LOGGED:
         _KPOOL_FUSED_SELECTION_LOGGED = True
@@ -3725,7 +3751,7 @@ def run_kpool_pool_topk(
             pool_size,
             options.topk_backend,
         )
-    return pool_ids
+    return (pool_ids, pool_scores) if return_scores else pool_ids
 
 
 def run_fused_qk_topk_with_loss(
@@ -5497,6 +5523,339 @@ class SparseIndexerLossFromTopKFunc(torch.autograd.Function):
         return gradients[: ctx.num_inputs]
 
 
+# ---------------------------------------------------------------------------------------
+# Trainable KPool indexer: the sparse pool-level KL on cuDNN frontend kernels
+# ---------------------------------------------------------------------------------------
+
+# First cuDNN frontend release whose SM100 sparse attention score recompute is right at the
+# trainable KPool shapes (absorbed MLA, 64 heads, latent 512). Earlier releases have no
+# producer/consumer barrier on the kernel's per-tile LSE and top-k-id slots and return wrong
+# targets without raising; cudnn-frontend #1225 fixed that, first released in 1.31.0.
+_KPOOL_SPARSE_LOSS_MIN_FE_VERSION = (1, 31)
+# Width alignment of the token ids handed to the KPool score recompute. Without
+# ``topk_length`` the kernel's tile at latent 512 and 64 heads is 128 slots wide and asserts on
+# a width that is only a multiple of 64; it zeroes interior ``-1`` slots. ``topk_length`` is
+# never passed: over interior ``-1`` ids it reads memory before the keys.
+_KPOOL_SCORE_RECOMPUTE_TOPK_ALIGNMENT = 128
+# Top-k block of the sparse indexer backward; the pool slots are padded to a multiple of it.
+_KPOOL_INDEXER_BACKWARD_BLOCK_I = 128
+
+
+def kpool_sparse_indexer_loss_decline_reason(
+    query: Tensor, key: Tensor, v_channels: int, deterministic: bool = False
+) -> Optional[str]:
+    """Why the cuDNN KPool indexer loss cannot run for this forward, or None when it can.
+
+    Host facts only, checked before selection: the installed cuDNN frontend (at least
+    ``_KPOOL_SPARSE_LOSS_MIN_FE_VERSION``), its DSA namespace, and whether the fused sparse
+    attention, whose LSE the teacher reads, accepts ``query`` ``[sq, b, np, hn]`` and the
+    absorbed latent ``key`` ``[skv, b, 1, hn]`` with ``v_channels`` latent value channels.
+    """
+    if not _cudnn_frontend_at_least(_KPOOL_SPARSE_LOSS_MIN_FE_VERSION):
+        installed = _cudnn_frontend_version()
+        version = "of unknown version" if installed is None else "%d.%d" % installed
+        return (
+            f"cuDNN frontend {version} is older than "
+            f"{'%d.%d' % _KPOOL_SPARSE_LOSS_MIN_FE_VERSION}: before cudnn-frontend #1225 "
+            "(1.31) its SM100 sparse attention score recompute returns wrong targets without "
+            "raising"
+        )
+    try:
+        _ensure_dsa_namespace()
+    except ImportError as exc:
+        return f"the cuDNN frontend DSA namespace is unavailable ({exc})"
+    reason = _fused_absorbed_sparse_attention_decline_reason(
+        query, key, v_channels, deterministic=deterministic
+    )
+    if reason is not None:
+        return f"the fused sparse attention, whose LSE the teacher reads, declines: {reason}"
+    return None
+
+
+@torch.no_grad()
+def run_kpool_attention_token_target(
+    query: Tensor, key: Tensor, lse: Tensor, token_topk: Tensor, softmax_scale: float
+) -> Tensor:
+    """Main-attention mass of each attended KPool token slot, from FE score recompute.
+
+    Args:
+        query: Absorbed main-attention query ``[sq, b, np, hn]`` (read detached).
+        key: Absorbed latent key ``[skv, b, 1, hn]`` (read detached).
+        lse: FP32 ``[sq, b, np]`` natural-log LSE that the fused sparse attention returned
+            (``return_lse=True``) for exactly the ids of ``token_topk``.
+        token_topk: ``[b, sq, width]`` local key ids the attention attended, ``-1`` for unused
+            slots: the selector's own layout, pool slots then the query-local tail.
+        softmax_scale: The main attention's softmax scale.
+
+    FE ``sparse_attn_score_recompute`` computes ``S_j = sum_h exp(softmax_scale * query_h .
+    key_j - lse_h)`` over the slots passed and L1-normalizes each row. With each head's own
+    LSE over these same ids, ``sum_j S_j`` is the local head count, so the result is the
+    head-summed attention probability of each slot divided by that count: a per-row constant
+    that the caller's pool normalization and tail-mass ratio cancel. The ids keep the
+    selector's layout, interior ``-1`` included, padded with ``-1`` to a multiple of
+    ``_KPOOL_SCORE_RECOMPUTE_TOPK_ALIGNMENT`` and passed without ``topk_length``.
+
+    Returns:
+        FP32 ``[b, sq, width]``, zero at ``-1`` slots.
+    """
+    if query.ndim != 4 or key.ndim != 4 or key.size(2) != 1 or token_topk.ndim != 3:
+        raise ValueError(
+            "KPool score recompute expects query [sq, b, np, hn], key [skv, b, 1, hn] and "
+            f"token ids [b, sq, width], got {tuple(query.shape)}, {tuple(key.shape)} and "
+            f"{tuple(token_topk.shape)}."
+        )
+    sq, batch, heads, _dim = query.shape
+    if tuple(lse.shape) != (sq, batch, heads) or tuple(token_topk.shape[:2]) != (batch, sq):
+        raise ValueError(
+            f"KPool score recompute expects lse [{sq}, {batch}, {heads}] and token ids "
+            f"[{batch}, {sq}, width], got {tuple(lse.shape)} and {tuple(token_topk.shape)}."
+        )
+    width = token_topk.size(-1)
+    valid = token_topk >= 0
+    if sq == 0 or width == 0 or key.size(0) == 0:
+        return torch.zeros((batch, sq, width), dtype=torch.float32, device=query.device)
+    ids = token_topk.to(torch.int32)
+    padded = round_up_to_nearest_multiple(width, _KPOOL_SCORE_RECOMPUTE_TOPK_ALIGNMENT)
+    if padded != width:
+        ids = torch.nn.functional.pad(ids, (0, padded - width), value=-1)
+    target = _compute_attn_target(
+        query.detach().permute(1, 0, 2, 3).contiguous(),
+        key.detach().squeeze(2).permute(1, 0, 2).contiguous(),
+        # A private copy: the attention's backward reads the LSE it returned.
+        lse.detach().permute(1, 0, 2).clone(memory_format=torch.contiguous_format),
+        ids.contiguous(),
+        None,
+        softmax_scale,
+        qhead_per_kv_head=heads,
+    )
+    target = target[..., :width].float()
+    return torch.where(valid, target, torch.zeros_like(target))
+
+
+def _kpool_sparse_indexer_loss_and_grads(
+    *,
+    q: Tensor,
+    weights: Tensor,
+    k_pooled: Tensor,
+    pool_ids: Tensor,
+    pool_scores: Tensor,
+    target: Tensor,
+    row_mask: Tensor,
+    row_count: Union[float, Tensor],
+    loss_coeff: float,
+    hf_scoring: bool,
+    deterministic: bool,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """The KPool sparse KL and its ``q``, ``weights`` and ``k_pooled`` gradients.
+
+    See :class:`KPoolSparseIndexerLossFromScoresFunc` for the arguments. The loss is computed
+    in PyTorch from the selector's pool scores; the gradients come from FE
+    ``indexer_backward_wrapper`` on the pooled keys, whose score is
+    ``I = sum_h w_h * relu(sm_scale * q_h . k)``. Under HF scoring ``weights`` carries
+    ``heads**-0.5``, so the kernel gets ``w = weights * heads**0.5`` (the BF16 projection,
+    exact after the cast) and ``sm_scale = (heads * head_dim)**-0.5``, and its ``d_weights``
+    is multiplied by ``heads**0.5``. Under legacy scoring both scales are already in
+    ``weights``: ``sm_scale = 1``. Slots outside the loss (``-1`` ids and rows outside
+    ``row_mask``) reach the kernel as ``-1`` with zero target and probability, so they get
+    exactly zero gradient.
+    """
+    sq, batch, heads, head_dim = q.shape
+    num_pools = k_pooled.size(0)
+    budget = pool_ids.size(-1)
+    if q.dtype != torch.bfloat16 or k_pooled.dtype != torch.bfloat16:
+        raise ValueError(
+            "The cuDNN KPool indexer loss needs BF16 q and pooled keys, got "
+            f"{q.dtype} and {k_pooled.dtype}."
+        )
+    if (
+        tuple(weights.shape) != (sq, batch, heads)
+        or tuple(k_pooled.shape[1:]) != (batch, head_dim)
+        or tuple(pool_ids.shape[:2]) != (batch, sq)
+        or pool_scores.shape != pool_ids.shape
+        or target.shape != pool_ids.shape
+        or tuple(row_mask.shape) != (batch, sq)
+    ):
+        raise ValueError(
+            "The cuDNN KPool indexer loss got inconsistent shapes: q "
+            f"{tuple(q.shape)}, weights {tuple(weights.shape)}, k_pooled "
+            f"{tuple(k_pooled.shape)}, pool_ids {tuple(pool_ids.shape)}, pool_scores "
+            f"{tuple(pool_scores.shape)}, target {tuple(target.shape)}, row_mask "
+            f"{tuple(row_mask.shape)}."
+        )
+    device = q.device
+    valid = pool_ids >= 0
+    row_mask = row_mask.to(dtype=torch.bool, device=device)
+    log_probs = dsa_masking.masked_log_softmax(pool_scores.float(), valid)
+    kl_per_row = dsa_indexer_loss.indexer_kl_per_row(target.float(), log_probs, valid)
+    kl_sum = kl_per_row.masked_fill(~row_mask, 0.0).sum()
+    if isinstance(row_count, Tensor):
+        row_count = row_count.detach().to(dtype=torch.float32, device=device)
+    loss = kl_sum / row_count * loss_coeff
+
+    grad_q = torch.zeros_like(q)
+    grad_weights = torch.zeros_like(weights)
+    grad_k = torch.zeros_like(k_pooled)
+    if sq == 0 or batch == 0 or budget == 0 or num_pools == 0:
+        return loss, grad_q, grad_weights, grad_k
+
+    slot_mask = valid & row_mask.unsqueeze(-1)
+    predict = log_probs.exp().masked_fill(~slot_mask, 0.0)
+    # As the token loss: the FE score-gradient stage gates the KL gradient on a positive
+    # probability, so keep selected probabilities at least FP32 tiny.
+    index_score = predict.clamp_min(_CLIP_PROB_MIN).masked_fill(~slot_mask, 0.0)
+    attn_score = target.float().masked_fill(~slot_mask, 0.0)
+    # Global ids over the flattened (batch, pool) keys, as _call_sparse_indexer_backward passes.
+    batch_offsets = torch.arange(batch, device=device, dtype=torch.int64).view(batch, 1, 1)
+    flat_ids = torch.where(slot_mask, pool_ids.to(torch.int64) + batch_offsets * num_pools, -1).to(
+        torch.int32
+    )
+    head_scale = heads**0.5 if hf_scoring else 1.0
+    sm_scale = (heads * head_dim) ** -0.5 if hf_scoring else 1.0
+    w_bsh = (weights.float() * head_scale if hf_scoring else weights).to(torch.bfloat16)
+    q_bshd, w_bsh, actual_heads = _pad_indexer_heads_for_backward(
+        q.permute(1, 0, 2, 3).contiguous(), w_bsh.permute(1, 0, 2).contiguous()
+    )
+    attn_score, index_score, flat_ids = _pad_sparse_backward_topk(
+        attn_score, index_score, flat_ids, _KPOOL_INDEXER_BACKWARD_BLOCK_I
+    )
+    # The kernel scales by grad_loss * loss_coeff / (batch * sq); the loss divides by row_count.
+    unit_grad_loss = torch.ones((), dtype=torch.float32, device=device) / row_count
+    grad_q_bshd, grad_w_bsh, grad_k_bsd = _run_sparse_indexer_backward(
+        q_bshd,
+        w_bsh,
+        k_pooled.permute(1, 0, 2).contiguous(),
+        attn_score.contiguous(),
+        index_score.contiguous(),
+        flat_ids.contiguous(),
+        loss_coeff=loss_coeff * batch * sq,
+        grad_loss=unit_grad_loss,
+        block_i=_KPOOL_INDEXER_BACKWARD_BLOCK_I,
+        deterministic=deterministic,
+        sm_scale=sm_scale,
+    )
+    grad_q_bshd, grad_w_bsh = _slice_indexer_backward_head_grads(
+        grad_q_bshd, grad_w_bsh, actual_heads
+    )
+    grad_q = grad_q_bshd.permute(1, 0, 2, 3).to(q.dtype).contiguous()
+    grad_weights = (grad_w_bsh.float() * head_scale).permute(1, 0, 2).to(weights.dtype)
+    grad_k = grad_k_bsd.permute(1, 0, 2).to(k_pooled.dtype).contiguous()
+    return loss, grad_q, grad_weights.contiguous(), grad_k
+
+
+class KPoolSparseIndexerLossFromScoresFunc(torch.autograd.Function):
+    """Sparse pool-level KL of a trainable KPool indexer, on cuDNN frontend kernels.
+
+    The ``SparseIndexerLossFromTopKFunc`` pattern: the forward computes the loss and, eagerly,
+    the gradients of ``q``, ``weights`` and ``k_pooled``; the backward returns them times the
+    incoming loss gradient, so autograd continues from ``k_pooled`` through the pool
+    compression and the CP gather of the pooled keys.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: Tensor,
+        weights: Tensor,
+        k_pooled: Tensor,
+        pool_ids: Tensor,
+        pool_scores: Tensor,
+        target: Tensor,
+        row_mask: Tensor,
+        row_count: Union[float, Tensor],
+        loss_coeff: float,
+        hf_scoring: bool,
+        deterministic: bool = False,
+    ) -> Tensor:
+        """Compute the loss and save its precomputed gradients.
+
+        Args:
+            q: BF16 indexer query ``[sq, b, heads, head_dim]`` as the selector scored it
+                (after any rotation).
+            weights: Indexer head weights ``[sq, b, heads]`` (FP32 carrying ``heads**-0.5``
+                under HF scoring, BF16 carrying every scale under legacy scoring).
+            k_pooled: BF16 pooled keys ``[pools, b, head_dim]`` as the selector scored them.
+            pool_ids: Selected pool ids ``[b, sq, slots]``, ``-1`` for unused slots.
+            pool_scores: The selector's FP32 score of each selected pool, aligned with
+                ``pool_ids``: the student logits.
+            target: Teacher ``[b, sq, slots]``, L1-normalized over the valid slots of rows
+                with pool mass, zero elsewhere.
+            row_mask: Rows that count ``[b, sq]`` (bool).
+            row_count: Divisor of the summed KL (Python number or 0-dim tensor).
+            loss_coeff: Indexer loss coefficient.
+            hf_scoring: Whether the indexer uses HF KPool scoring.
+            deterministic: Accumulate the pooled-key gradient without atomics.
+
+        Returns:
+            ``loss_coeff * sum_rows(row_mask * KL(target || softmax(pool_scores))) / row_count``,
+            a 0-dim FP32 tensor.
+        """
+        loss, grad_q, grad_weights, grad_k = _kpool_sparse_indexer_loss_and_grads(
+            q=q,
+            weights=weights,
+            k_pooled=k_pooled,
+            pool_ids=pool_ids,
+            pool_scores=pool_scores,
+            target=target,
+            row_mask=row_mask,
+            row_count=row_count,
+            loss_coeff=loss_coeff,
+            hf_scoring=hf_scoring,
+            deterministic=deterministic,
+        )
+        ctx.save_for_backward(grad_q, grad_weights, grad_k)
+        ctx.num_inputs = len(ctx.needs_input_grad)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        """Scale the saved gradients by the incoming loss gradient."""
+        grad_q, grad_weights, grad_k = ctx.saved_tensors
+        if grad_loss is None:
+            gradients = (None, None, None)
+        else:
+            gradients = (grad_q * grad_loss, grad_weights * grad_loss, grad_k * grad_loss)
+        # Grads: q, weights, k_pooled, then None for pool_ids, pool_scores, target, row_mask,
+        #   row_count, loss_coeff, hf_scoring, deterministic.
+        return (gradients + (None,) * 8)[: ctx.num_inputs]
+
+
+def run_kpool_sparse_indexer_loss(
+    q: Tensor,
+    weights: Tensor,
+    k_pooled: Tensor,
+    pool_ids: Tensor,
+    pool_scores: Tensor,
+    target: Tensor,
+    row_mask: Tensor,
+    row_count: Union[float, Tensor],
+    loss_coeff: float,
+    hf_scoring: bool,
+    use_relu: bool = True,
+    deterministic: bool = False,
+) -> Tensor:
+    """The trainable KPool indexer loss on cuDNN frontend kernels, graph-connected to ``q``,
+    ``weights`` and ``k_pooled``; see :class:`KPoolSparseIndexerLossFromScoresFunc`.
+
+    Raises instead of declining: the caller chose this path for the forward.
+    """
+    if not use_relu:
+        raise ValueError("The cuDNN KPool indexer loss scores with ReLU only.")
+    _ensure_dsa_namespace()
+    return KPoolSparseIndexerLossFromScoresFunc.apply(
+        q,
+        weights,
+        k_pooled,
+        pool_ids,
+        pool_scores,
+        target,
+        row_mask,
+        row_count,
+        loss_coeff,
+        hf_scoring,
+        bool(deterministic or torch.are_deterministic_algorithms_enabled()),
+    )
+
+
 class FusedSparseAttentionFunc(torch.autograd.Function):
     """Fused sparse attention with provided top-k indices for DSA index sharing.
 
@@ -5596,6 +5955,33 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         return gradients[: ctx.num_inputs]
 
 
+def _fused_absorbed_sparse_attention_decline_reason(
+    query: Tensor, key: Tensor, v_channels: int, *, deterministic: bool = False
+) -> Optional[str]:
+    """Why :func:`run_fused_absorbed_sparse_attention` declines this query and key, or None.
+
+    The checks that do not depend on the top-k ids, so a caller can learn before selecting
+    whether the fused sparse attention (and its LSE) will run.
+    """
+    if query.ndim != 4 or key.ndim != 4:
+        return "expected query [sq, b, np, hn] and key [skv, b, 1, hn]"
+    # Empty KV cannot provide a valid fixed-shape backward safe tile.
+    if key.size(0) == 0 or key.size(2) != 1 or v_channels <= 0:
+        return "the key is empty, has more than one head, or there are no latent value channels"
+    if key.size(1) != query.size(1) or key.size(3) != query.size(3):
+        return "the query and key batch or channel counts differ"
+    if not _supports_flash_mla_value_layout(key.size(-1), v_channels):
+        return (
+            f"FlashMLA needs {_FLASH_MLA_REQUIRED_VALUE_DIM} latent value channels in a key at "
+            f"least that wide, got {v_channels} in {key.size(-1)}"
+        )
+    if not _flash_mla_supports_head_count(query):
+        return f"FlashMLA does not support {query.size(2)} local query heads"
+    if deterministic and not _supports_deterministic_sparse_attention_backward(query):
+        return "no deterministic sparse attention backward supports this device and head count"
+    return None
+
+
 def run_fused_absorbed_sparse_attention(
     query: Tensor,
     key: Tensor,
@@ -5635,18 +6021,14 @@ def run_fused_absorbed_sparse_attention(
     """
     if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
         return None
-    # Empty KV or zero-width top-k cannot provide a valid fixed-shape backward safe tile.
-    if key.size(0) == 0 or key.size(2) != 1 or topk_indices.size(2) == 0 or v_channels <= 0:
+    # A zero-width top-k cannot provide a valid fixed-shape backward safe tile.
+    if topk_indices.size(2) == 0:
         return None
     if query.size(0) != topk_indices.size(1) or query.size(1) != topk_indices.size(0):
         return None
-    if key.size(1) != query.size(1) or key.size(3) != query.size(3):
-        return None
-    if not _supports_flash_mla_value_layout(key.size(-1), v_channels):
-        return None
-    if not _flash_mla_supports_head_count(query):
-        return None
-    if deterministic and not _supports_deterministic_sparse_attention_backward(query):
+    if _fused_absorbed_sparse_attention_decline_reason(
+        query, key, v_channels, deterministic=deterministic
+    ):
         return None
 
     kv_full = key.squeeze(2).contiguous()
