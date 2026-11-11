@@ -11,7 +11,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -4118,6 +4118,7 @@ def _deterministic_sparse_indexer_grads_wk(
     loss_coeff: float,
     grad_loss: Tensor,
     compute_grad_w: bool,
+    sm_scale: float = _INDEXER_SOFTMAX_SCALE,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """Recompute sparse-indexer dK, and optionally dW, without floating-point atomics.
 
@@ -4133,6 +4134,9 @@ def _deterministic_sparse_indexer_grads_wk(
     exact zeros.  SM90 also merges per-thread dW partials with shared-memory atomics, so its
     deterministic path computes dW from the same dot products and score gradients.  SM100
     uses fixed-order, unique dW stores and keeps cuDNN's result.
+
+    ``sm_scale`` is the indexer score scale of the cuDNN wrapper, the ``s`` of
+    ``I = sum_h w_h * relu(s * q_h . k)``.
     """
     batch, sq, indexer_heads, indexer_dim = q_idx_bshd.shape
     if k_idx_bsd.shape[0] != batch or w_bsh.shape[:2] != (batch, sq):
@@ -4161,7 +4165,7 @@ def _deterministic_sparse_indexer_grads_wk(
     # The cuDNN KL backward normalizes by B*S_q.  The caller already folds the
     # per-token-loss and valid-row corrections into loss_coeff/grad_loss.
     grad_scale = grad_loss.to(dtype=torch.float32) * (loss_coeff / (batch * sq))
-    grad_scale = grad_scale * _INDEXER_SOFTMAX_SCALE
+    grad_scale = grad_scale * sm_scale
     grad_k_flat = torch.zeros(
         (total_keys, indexer_dim), device=k_idx_bsd.device, dtype=torch.float32
     )
@@ -4223,6 +4227,7 @@ def _call_sparse_indexer_backward(
     loss_coeff: float,
     grad_loss: Tensor,
     block_i: int,
+    sm_scale: float = _INDEXER_SOFTMAX_SCALE,
 ) -> dict:
     """Call either generation of the cuDNN wrapper with global flattened KV ids.
 
@@ -4231,10 +4236,13 @@ def _call_sparse_indexer_backward(
     sparse-loss path has always materialized global ``B * S_k + local`` ids, so set
     the selector whenever the installed wrapper supports it while preserving the
     historical call signature.
+
+    ``sm_scale`` is the wrapper's indexer score scale ``s`` in
+    ``I = sum_h w_h * relu(s * q_h . k)``.
     """
     wrapper = _cudnn_dsa.indexer_backward_wrapper
     kwargs = {
-        "sm_scale": _INDEXER_SOFTMAX_SCALE,
+        "sm_scale": sm_scale,
         "loss_coeff": loss_coeff,
         "grad_loss": grad_loss,
         "block_I": block_i,
@@ -4262,8 +4270,15 @@ def _run_sparse_indexer_backward(
     grad_loss: Tensor,
     block_i: int,
     deterministic: bool = False,
+    sm_scale: float = _INDEXER_SOFTMAX_SCALE,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Run cuDNN sparse indexer backward with deterministic atomic-free replacements."""
+    """Run cuDNN sparse indexer backward with deterministic atomic-free replacements.
+
+    ``sm_scale`` is the indexer score scale ``s`` in ``I = sum_h w_h * relu(s * q_h . k)``,
+    the scores whose softmax ``index_score`` holds; for ``s > 0`` dQ, dW and dK are
+    proportional to it. The default, ``_INDEXER_SOFTMAX_SCALE``, is the scale of the
+    token-level indexer loss.
+    """
     deterministic_grad_w = None
     deterministic_grad_k = None
     if deterministic:
@@ -4278,6 +4293,7 @@ def _run_sparse_indexer_backward(
             loss_coeff=loss_coeff,
             grad_loss=grad_loss,
             compute_grad_w=_requires_native_deterministic_indexer_grad_w(q_idx_bshd),
+            sm_scale=sm_scale,
         )
 
     sq = q_idx_bshd.size(1)
@@ -4292,6 +4308,7 @@ def _run_sparse_indexer_backward(
             loss_coeff=loss_coeff,
             grad_loss=grad_loss,
             block_i=block_i,
+            sm_scale=sm_scale,
         )
         grad_w = deterministic_grad_w if deterministic_grad_w is not None else result["d_weights"]
         grad_k = deterministic_grad_k if deterministic_grad_k is not None else result["d_index_k"]
@@ -4313,6 +4330,7 @@ def _run_sparse_indexer_backward(
             loss_coeff=loss_coeff * chunk_rows / sq,
             grad_loss=grad_loss,
             block_i=block_i,
+            sm_scale=sm_scale,
         )
         grad_q[:, row_start:row_end].copy_(result["d_index_q"])
         if deterministic_grad_w is None:
@@ -5480,7 +5498,12 @@ class SparseIndexerLossFromTopKFunc(torch.autograd.Function):
 
 
 class FusedSparseAttentionFunc(torch.autograd.Function):
-    """Fused sparse attention with provided top-k indices for DSA index sharing."""
+    """Fused sparse attention with provided top-k indices for DSA index sharing.
+
+    Differentiable w.r.t. ``query`` and ``kv_full``. With ``return_lse=True`` the forward
+    also returns the attention LSE, which is not differentiable; see
+    :func:`run_fused_absorbed_sparse_attention` for its layout.
+    """
 
     @staticmethod
     def forward(
@@ -5493,7 +5516,8 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         topk_length: Optional[Tensor],
         all_topk_rows_nonempty: bool,
         deterministic: bool,
-    ) -> Tensor:
+        return_lse: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """Run fused sparse attention for precomputed top-k metadata."""
         sq, b, num_heads, d = query.shape
         skv = kv_full.shape[0]
@@ -5517,12 +5541,32 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         ctx.skv = skv
         ctx.all_topk_rows_nonempty = all_topk_rows_nonempty
         ctx.deterministic = deterministic
+        # Direct ``apply`` callers may omit the trailing ``return_lse``.
+        ctx.num_inputs = len(ctx.needs_input_grad)
 
-        return out_flat.reshape(sq, b, num_heads, d_v)
+        output = out_flat.reshape(sq, b, num_heads, d_v)
+        if not return_lse:
+            return output
+        # ``lse`` is ``(sq * b, num_heads)`` with flattened row ``s * b + b_idx``, as
+        # ``q_flat``. The view shares the saved tensor's version counter, so an in-place
+        # change by the caller fails backward's saved-tensor check instead of changing dQ/dKV.
+        lse_sbh = lse.view(sq, b, num_heads)
+        ctx.mark_non_differentiable(lse_sbh)
+        # Only ``output`` carries a gradient; do not allocate a zero gradient for the LSE.
+        ctx.set_materialize_grads(False)
+        return output, lse_sbh
 
     @staticmethod
-    def backward(ctx, grad_output):
-        """Run sparse attention backward for saved cuDNN graph inputs."""
+    def backward(ctx, grad_output, *_unused_grad_lse):
+        """Run sparse attention backward for saved cuDNN graph inputs.
+
+        The LSE output of ``return_lse=True`` is non-differentiable, so its incoming
+        gradient (``None``) is ignored.
+        """
+        if grad_output is None:
+            # With ``return_lse=True`` gradients are not materialized, so an undefined output
+            # gradient arrives as None: no gradient flows to Q or KV.
+            return (None,) * ctx.num_inputs
         q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse = ctx.saved_tensors
 
         sq, b, num_heads, d = ctx.sq, ctx.b, ctx.num_heads, ctx.d
@@ -5546,7 +5590,10 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
         )
 
-        return grad_query, grad_kv_full, None, None, None, None, None, None
+        # Grads: query, kv_full, then None for topk_indices, softmax_scale, d_v,
+        #   topk_length, all_topk_rows_nonempty, deterministic, return_lse.
+        gradients = (grad_query, grad_kv_full) + (None,) * 7
+        return gradients[: ctx.num_inputs]
 
 
 def run_fused_absorbed_sparse_attention(
@@ -5558,8 +5605,34 @@ def run_fused_absorbed_sparse_attention(
     topk_length: Optional[Tensor] = None,
     all_topk_rows_nonempty: bool = False,
     deterministic: bool = False,
-) -> Optional[Tensor]:
-    """Run cuDNN/FlashMLA sparse attention using externally supplied top-k indices."""
+    return_lse: bool = False,
+) -> Optional[Union[Tensor, Tuple[Tensor, Tensor]]]:
+    """Run cuDNN/FlashMLA sparse attention using externally supplied top-k indices.
+
+    Args:
+        query: ``[sq, b, np, hn]`` absorbed attention query.
+        key: ``[skv, b, 1, hn]`` absorbed latent key; its first ``v_channels`` channels are
+            the latent value.
+        topk_indices: ``[b, sq, topk]`` local key ids of each query row, ``-1`` for unused
+            slots.
+        topk_length: optional ``[b, sq]`` count of leading slots to attend; without it the
+            ids are compacted and ``-1`` slots dropped.
+        return_lse: also return the attention log-sum-exp (see Returns).
+
+    Returns:
+        None when this kernel does not support the shapes or layout (the caller falls back).
+        Otherwise the latent output ``[sq, b, np, v_channels]``, or with ``return_lse=True``
+        the tuple ``(output, lse)``:
+
+        * ``lse`` is FP32 ``[sq, b, np]``: axis 0 the query row, axis 1 the batch, axis 2
+          the local attention head, the order of ``query``'s first three axes.
+        * ``lse[s, b, h] = log(sum_j exp(softmax_scale * query[s, b, h, :] . key[j, b, 0, :]))``
+          in the natural log, over the keys ``j`` that row ``s`` attends. It is the LSE that
+          FlashMLA's forward returns and that the sparse attention backward and the cuDNN
+          frontend's sparse score recompute read. A row that attends no key has ``+inf``.
+        * It is not differentiable: backward ignores it. It is the tensor the backward
+          reads, so callers must not modify it in place.
+    """
     if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
         return None
     # Empty KV or zero-width top-k cannot provide a valid fixed-shape backward safe tile.
@@ -5586,6 +5659,7 @@ def run_fused_absorbed_sparse_attention(
         topk_length,
         all_topk_rows_nonempty,
         deterministic,
+        return_lse,
     )
 
 

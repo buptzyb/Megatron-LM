@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from importlib import import_module
 from types import ModuleType
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -448,28 +448,46 @@ def run_fused_absorbed_sparse_attention(
     v_channels: int,
     topk_length: Optional[Tensor] = None,
     all_topk_rows_nonempty: bool = False,
-) -> Optional[Tensor]:
-    """Optional fused sparse-attention hook for backend-specific implementations."""
+    return_lse: bool = False,
+) -> Optional[Union[Tensor, Tuple[Tensor, Tensor]]]:
+    """Optional fused sparse-attention hook for backend-specific implementations.
+
+    Returns the backend's latent output, or None when no backend is selected or it declines.
+    With ``return_lse=True`` a backend result is ``(output, lse)``, where ``lse`` is the
+    non-differentiable FP32 ``[sq, b, np]`` natural-log attention LSE described in
+    ``dsa_cudnn_kernels.run_fused_absorbed_sparse_attention``. A selected backend whose hook
+    does not declare ``return_lse`` raises instead of running, and so does a hook that then
+    returns no LSE.
+    """
     fn = _resolve_fused_hook(config, "run_fused_absorbed_sparse_attention")
     if fn is None:
         return None
-    result = fn(
-        query,
-        key,
-        topk_indices,
-        softmax_scale,
-        v_channels,
-        topk_length,
-        **filter_kwargs_for_callable(
-            fn,
-            {
-                "all_topk_rows_nonempty": all_topk_rows_nonempty,
-                "deterministic": _deterministic_dsa_requested(config),
-            },
-        ),
-    )
+    optional_kwargs = {
+        "all_topk_rows_nonempty": all_topk_rows_nonempty,
+        "deterministic": _deterministic_dsa_requested(config),
+    }
+    if return_lse:
+        # Offered only when requested, so hooks without the argument keep their old call.
+        optional_kwargs["return_lse"] = True
+    hook_kwargs = filter_kwargs_for_callable(fn, optional_kwargs)
+    if return_lse and "return_lse" not in hook_kwargs:
+        raise RuntimeError(
+            f"DSA kernel backend {_get_dsa_kernel_backend(config)!r} cannot return the "
+            "sparse-attention LSE: its run_fused_absorbed_sparse_attention hook takes no "
+            "return_lse argument."
+        )
+    result = fn(query, key, topk_indices, softmax_scale, v_channels, topk_length, **hook_kwargs)
     if result is None:
         _log_declined_hook(config, "run_fused_absorbed_sparse_attention", "backend returned None")
+        return None
+    if return_lse and not (
+        isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], Tensor)
+    ):
+        raise RuntimeError(
+            f"DSA kernel backend {_get_dsa_kernel_backend(config)!r} "
+            "run_fused_absorbed_sparse_attention was asked for the LSE (return_lse=True) but "
+            "did not return an (output, lse) pair."
+        )
     return result
 
 

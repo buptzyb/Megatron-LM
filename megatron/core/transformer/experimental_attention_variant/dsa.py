@@ -167,8 +167,22 @@ def _run_sparse_attention(
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
     all_topk_rows_nonempty: bool = False,
-) -> torch.Tensor:
-    """Run sparse attention for absorbed and non-absorbed MLA paths."""
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Run sparse attention for absorbed and non-absorbed MLA paths.
+
+    Returns the attention output. With ``return_lse=True`` it returns ``(output, lse)``
+    instead, where ``lse`` is the non-differentiable FP32 ``[sq, b, np]``
+    natural-log LSE of the fused sparse-attention kernel (layout in
+    ``dsa_cudnn_kernels.run_fused_absorbed_sparse_attention``). Only the fused absorbed-MLA
+    path returns it: when no fused backend runs the call, ``return_lse=True`` raises instead
+    of falling back to the PyTorch path, which computes no LSE.
+    """
+    if return_lse and not (absorbed_mla and dsa_kernels.use_fused_dsa_kernels(config)):
+        raise RuntimeError(
+            "return_lse=True needs the fused absorbed-MLA sparse attention (absorbed MLA and "
+            "a fused dsa_kernel_backend); the unfused DSA attention does not return the LSE."
+        )
     if absorbed_mla:
         latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
         if latent_v_channels <= 0:
@@ -185,6 +199,7 @@ def _run_sparse_attention(
                 "Received absorbed layout with explicit value tensor."
             )
         output = None
+        lse = None
         if dsa_kernels.use_fused_dsa_kernels(config):
             output = dsa_kernels.run_fused_absorbed_sparse_attention(
                 config,
@@ -195,7 +210,17 @@ def _run_sparse_attention(
                 latent_v_channels,
                 topk_length=topk_length,
                 all_topk_rows_nonempty=all_topk_rows_nonempty,
+                # Passed only when requested, so the default call is unchanged.
+                **({"return_lse": True} if return_lse else {}),
             )
+            if return_lse:
+                if output is None:
+                    raise RuntimeError(
+                        f"DSA kernel backend {config.dsa_kernel_backend!r} declined the fused "
+                        "sparse attention, and return_lse=True cannot fall back to the "
+                        "unfused path, which does not return the LSE."
+                    )
+                output, lse = output
         # Fused backends may decline unsupported shapes or layouts by returning
         # None, so keep the absorbed PyTorch path as the authoritative fallback.
         if output is None:
@@ -213,6 +238,8 @@ def _run_sparse_attention(
         assert output is not None
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
+        if return_lse:
+            return output, lse
         return output
 
     return unfused_dsa_fn(
