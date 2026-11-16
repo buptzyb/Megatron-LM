@@ -2078,7 +2078,9 @@ class TransformerConfig(ModelParallelConfig):
     mhc_fused_backend: Literal["auto", "native", "triton", "cutile"] = "auto"
     """Backend policy for fused mHC operations.
 
-    ``auto`` selects the fastest available implementation for each operation.
+    ``auto`` selects the fastest available implementation for each operation,
+    except that h_aggregate runs its cuTile kernels only under ``cutile``
+    (``auto`` with ``MHC_FORCE_BACKEND=cutile`` runs native h_aggregate).
     Explicit policies require the requested dependency and device support, and
     never select a different accelerated backend. Operations without an
     implementation in the selected backend retain their native implementation.

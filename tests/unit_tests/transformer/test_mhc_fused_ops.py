@@ -699,7 +699,7 @@ def test_fmk_op_labels_follow_fmk_resolution(monkeypatch, triton_only_fmk):
     assert hc._fmk_op_labels("auto", MHC_FUSED_OPS) == {
         "proj_rms": "fmk(auto:native)",
         "sinkhorn": "fmk(auto:triton)",
-        "h_aggregate": "fmk(auto:fwd:triton,bwd:native)",
+        "h_aggregate": "fmk(auto:fwd:triton,bwd:triton)",
         "h_post_bda": "fmk(auto:fwd:triton,bwd:triton)",
     }
     assert hc._fmk_op_labels("native", ["h_aggregate"]) == {
@@ -707,11 +707,18 @@ def test_fmk_op_labels_follow_fmk_resolution(monkeypatch, triton_only_fmk):
     }
     monkeypatch.setattr(fmk, "is_triton_available", lambda: False)
     monkeypatch.setattr(fmk, "is_cutile_available", lambda: True)
+    # auto never selects the cuTile h_aggregate kernels; only the explicit cutile policy does.
     assert hc._fmk_op_labels("auto", MHC_FUSED_OPS) == {
         "proj_rms": "fmk(auto:cutile)",
         "sinkhorn": "fmk(auto:cutile)",
-        "h_aggregate": "fmk(auto:fwd:cutile,bwd:cutile)",
+        "h_aggregate": "fmk(auto:fwd:native,bwd:native)",
         "h_post_bda": "fmk(auto:fwd:cutile,bwd:cutile)",
+    }
+    assert hc._fmk_op_labels("cutile", MHC_FUSED_OPS) == {
+        "proj_rms": "fmk(cutile:cutile)",
+        "sinkhorn": "fmk(cutile:cutile)",
+        "h_aggregate": "fmk(cutile:fwd:cutile,bwd:cutile)",
+        "h_post_bda": "fmk(cutile:fwd:cutile,bwd:cutile)",
     }
     monkeypatch.setattr(
         fmk, "_mhc_backend_status", lambda backend: (f"policy={backend}; sinkhorn=triton", False)
@@ -1059,7 +1066,7 @@ _PER_OP_FMK_OPS = ["proj_rms", "h_aggregate", "h_post_bda"]
             dict(use_fused_mhc=True, mhc_fused_ops=_PER_OP_FMK_OPS),
             None,
             "mode=per-op policy=auto MHC_FORCE_BACKEND=unset proj_rms=fmk(auto:native) "
-            "sinkhorn=native h_aggregate=fmk(auto:fwd:triton,bwd:native) "
+            "sinkhorn=native h_aggregate=fmk(auto:fwd:triton,bwd:triton) "
             "h_post_bda=fmk(auto:fwd:triton,bwd:triton)",
         ),
         (
@@ -1082,7 +1089,7 @@ _PER_OP_FMK_OPS = ["proj_rms", "h_aggregate", "h_post_bda"]
             dict(use_fused_mhc=True),
             None,
             "mode=all-ops policy=auto MHC_FORCE_BACKEND=unset proj_rms=fmk(auto:native) "
-            "sinkhorn=fmk(auto:triton) h_aggregate=fmk(auto:fwd:triton,bwd:native) "
+            "sinkhorn=fmk(auto:triton) h_aggregate=fmk(auto:fwd:triton,bwd:triton) "
             "h_post_bda=fmk(auto:fwd:triton,bwd:triton)",
         ),
         (

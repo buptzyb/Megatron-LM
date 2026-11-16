@@ -567,6 +567,45 @@ def test_native_mhc_aggregate_into_replays_fwd_bwd(dtype):
     )
 
 
+# On GB300 (sm_103) the cuTile h_aggregate backward still reads a wrong h operand for streams 0-1
+# in some CTAs, and 'auto' no longer selects it, so its forced cases are flaky_in_dev.
+_H_AGGREGATE_INTO_BACKENDS = [
+    "auto",
+    *(
+        pytest.param(backend, marks=pytest.mark.flaky_in_dev) if backend == "cutile" else backend
+        for backend in _MHC_BACKENDS
+    ),
+]
+
+
+@pytest.mark.parametrize("backend", _H_AGGREGATE_INTO_BACKENDS)
+@pytest.mark.parametrize("s,b,n,c", [(S, B, N, C), (128, 2, 4, 128)])
+def test_mhc_h_aggregate_into_replays_fwd_bwd(backend, s, b, n, c):
+    """Replay the public caller-owned aggregate at one fixed address, including both gradients.
+
+    ``auto`` and ``triton`` run the Triton forward and the fixed-launch Triton backward; C=128
+    is the width at which the module replay caught the cuTile backward's wrong operand.
+    """
+    if backend == "triton" and not fused_mhc_kernels.is_triton_available():
+        pytest.skip("Triton mHC backend unavailable")
+    seeded()
+    x = _mhc_rand(s, b, n, c)
+    h_pre = _mhc_rand(s, b, n)
+    out = torch.empty(s, b, c, device="cuda", dtype=x.dtype)
+    pointer = out.data_ptr()
+
+    def run(value, weights):
+        result = fused_mhc_kernels.fused_h_aggregate_into(
+            value, weights, out.detach(), backend=backend
+        )
+        assert result.data_ptr() == pointer
+        return result
+
+    assert_replays_bit_exact(
+        run, (x, h_pre), replays=3, contention=True, what=f"mhc h_aggregate_into[{backend}]"
+    )
+
+
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_mhc_h_post_bda_replays_fwd_bwd(backend, with_bias):
