@@ -2,7 +2,8 @@
 
 """Per-operation fused mHC selection (``mhc_fused_ops``): config, CLI, binding and logging.
 
-Every test only constructs configs and modules, so all of them run on CPU. CI runs each test
+Every test only constructs configs and modules, apart from the CPU ``_projection_and_get_norm``
+forward of the GLM projection pair's refusal test, so all of them run on CPU. CI runs each test
 on 8 ranks at once, so nothing here assumes rank 0: the logging tests patch the rank helpers,
 and an autouse fixture resets the module's once-per-process latches for every test.
 """
@@ -50,7 +51,6 @@ MODULE_LEGACY_MESSAGE = (
     "Fused mHC does not support FP32 mixing, epsilon inside sqrt, normalize-before-projection or "
     "activation-dtype rounding preservation."
 )
-NO_PER_OP_IMPLEMENTATION = "native(no per-op implementation)"
 TRITON_SINKHORN = "triton(num_warps=1)"
 # Every bound operation that the unfused binding holds as a module-level object (or None).
 MODULE_LEVEL_OPS = (
@@ -633,52 +633,47 @@ def test_per_op_binds_only_listed_ops(monkeypatch, triton_only_fmk, warnings_log
 def test_per_op_glm_binding_keeps_the_parity_contract(triton_only_fmk, warnings_logged):
     """[proj_rms, sinkhorn] with the GLM flags keeps the objects the parity tests require.
 
-    Only the Sinkhorn changes: it binds the fixed-launch Triton Sinkhorn.
+    Only the Sinkhorn and the GLM projection pair change: sinkhorn binds the fixed-launch Triton
+    Sinkhorn, and proj_rms the Triton GLM projection pair, which _projection_and_get_norm runs.
     """
     config = _per_op(["proj_rms", "sinkhorn"], **GLM_FLAGS)
     module = _module(config)
     # The projection runs inside _projection_and_get_norm, and the post is the emulate-casts
     # compile (test_glm53_hybrid_native_parity.py).
     assert module._proj_rms_compute_h_op is None
-    assert module._glm_proj_rms_op is None
+    assert module._glm_proj_rms_op is glm.glm_proj_rms_op("rn")
     assert module._h_post_bda_op is hc._get_precision_preserving_h_post_bda()
     assert module._proj_rms_op.keywords == {
         "eps_inside_sqrt": True,
         "normalize_before_projection": True,
     }
     assert module._sinkhorn_op is glm.fixed_launch_sinkhorn
-    _assert_same_binding(module, _module(_config(**GLM_FLAGS)), exclude=("_sinkhorn_op",))
+    _assert_same_binding(
+        module, _module(_config(**GLM_FLAGS)), exclude=("_sinkhorn_op", "_glm_proj_rms_op")
+    )
     assert module._fused_op_labels == {
-        "proj_rms": NO_PER_OP_IMPLEMENTATION,
+        "proj_rms": "glm-triton(tf32=rn)",
         "sinkhorn": TRITON_SINKHORN,
         "h_aggregate": "native",
         "h_post_bda": "native(emulate-casts)",
     }
-    assert warnings_logged == [
-        (
-            logging.WARNING,
-            "[mHC] Falling back to the unfused path for mhc_fused_ops ['proj_rms']: "
-            "no per-op implementation in this build.",
-        )
-    ]
-    # Once per process.
-    _module(config)
-    assert len(warnings_logged) == 1
+    assert warnings_logged == []
 
 
 @pytest.mark.parametrize("ops, flags", [(["proj_rms", "sinkhorn"], GLM_FLAGS)], ids=["glm"])
-def test_per_op_explicit_triton_fails_without_per_op_implementation(triton_only_fmk, ops, flags):
-    """An explicit triton policy never falls back to the unfused path: it fails at construction.
+def test_per_op_explicit_triton_binds_the_glm_pair(triton_only_fmk, ops, flags):
+    """An explicit triton policy constructs the GLM overlay and binds both Triton operations.
 
-    This build has no Triton per-op implementation for proj_rms with the GLM flags, so the error
-    names proj_rms only (sinkhorn binds); this test changes once that implementation exists.
+    The policy is enforced at call time: an input the pair does not support raises
+    (test_per_op_glm_pair_refusal_policy).
     """
-    with pytest.raises(RuntimeError) as error:
-        _module(_per_op(ops, mhc_fused_backend="triton", **flags))
-    assert str(error.value) == (
-        "mHC fused backend 'triton' was requested for ['proj_rms'], but this build has no "
-        "Triton per-op implementation for them."
-    )
+    module = _module(_per_op(ops, mhc_fused_backend="triton", **flags))
+    assert module._glm_proj_rms_op is glm.glm_proj_rms_op("rn")
+    assert module._sinkhorn_op is glm.fixed_launch_sinkhorn
+    assert {op: module._fused_op_labels[op] for op in ops} == {
+        "proj_rms": "glm-triton(tf32=rn)",
+        "sinkhorn": TRITON_SINKHORN,
+    }
 
 
 @pytest.mark.parametrize(
@@ -693,7 +688,7 @@ def test_per_op_explicit_triton_fails_without_per_op_implementation(triton_only_
             ["proj_rms", "sinkhorn"],
             GLM_FLAGS,
             {
-                "proj_rms": NO_PER_OP_IMPLEMENTATION,
+                "proj_rms": "native(triton unavailable)",
                 "h_aggregate": "native",
                 "h_post_bda": "native(emulate-casts)",
             },
@@ -704,7 +699,11 @@ def test_per_op_explicit_triton_fails_without_per_op_implementation(triton_only_
 def test_per_op_sinkhorn_without_triton_keeps_native(
     monkeypatch, warnings_logged, ops, flags, labels
 ):
-    """Under auto on a rank without Triton, sinkhorn keeps the unfused Sinkhorn, with a warning."""
+    """Under auto on a rank without Triton, the Triton-only operations keep their unfused objects.
+
+    sinkhorn keeps the unfused Sinkhorn, and with the GLM flags proj_rms keeps the unfused
+    projection; one warning names them, in table order.
+    """
     monkeypatch.setattr(fmk, "is_triton_available", lambda: False)
     monkeypatch.setattr(fmk, "is_cutile_available", lambda: False)
     config = _per_op(ops, **flags)
@@ -712,22 +711,14 @@ def test_per_op_sinkhorn_without_triton_keeps_native(
     assert module._sinkhorn_op is hc.native_sinkhorn
     _assert_same_binding(module, _module(_config(**flags)))
     assert module._fused_op_labels == dict(labels, sinkhorn="native(triton unavailable)")
+    unavailable = ["proj_rms", "sinkhorn"] if "proj_rms" in ops else ["sinkhorn"]
     expected = [
         (
             logging.WARNING,
-            "[mHC] Falling back to the unfused path for mhc_fused_ops ['sinkhorn']: "
+            f"[mHC] Falling back to the unfused path for mhc_fused_ops {unavailable}: "
             "Triton is unavailable.",
         )
     ]
-    if "proj_rms" in ops:
-        expected.insert(
-            0,
-            (
-                logging.WARNING,
-                "[mHC] Falling back to the unfused path for mhc_fused_ops ['proj_rms']: "
-                "no per-op implementation in this build.",
-            ),
-        )
     assert warnings_logged == expected
     # Once per process.
     _module(config)
@@ -743,6 +734,59 @@ def test_per_op_sinkhorn_label_reads_the_num_warps_constant(monkeypatch, triton_
     module = _module(_per_op(["sinkhorn"]))
     assert module._sinkhorn_op is glm.fixed_launch_sinkhorn
     assert module._fused_op_labels["sinkhorn"] == "triton(num_warps=2)"
+
+
+@pytest.mark.parametrize("rounding", ["rn", "rz"])
+def test_per_op_glm_pair_label_reads_the_rounding(triton_only_fmk, rounding):
+    """proj_rms with the GLM flags binds the op object of mhc_fused_tf32_rounding (one per
+    rounding, so identity compares), and the label names the rounding."""
+    module = _module(_per_op(["proj_rms"], mhc_fused_tf32_rounding=rounding, **GLM_FLAGS))
+    assert module._glm_proj_rms_op is glm.glm_proj_rms_op(rounding)
+    assert module._fused_op_labels["proj_rms"] == f"glm-triton(tf32={rounding})"
+
+
+@pytest.mark.parametrize("policy", ["auto", "triton"])
+def test_per_op_glm_pair_refusal_policy(triton_only_fmk, warnings_logged, policy):
+    """The GLM projection pair refuses CPU inputs at call time, and the spy counts the refusal.
+
+    auto warns once per reason and returns the unfused module's projection, bit for bit; an
+    explicit triton policy raises instead of falling back.
+    """
+    module = _module(_per_op(["proj_rms", "sinkhorn"], mhc_fused_backend=policy, **GLM_FLAGS))
+    reference = _module(_config(**GLM_FLAGS))
+    reference.load_state_dict(module.state_dict())
+    x = torch.randn(4, 2, 4 * 32, generator=torch.Generator().manual_seed(0)).bfloat16()
+    message = (
+        "the Triton GLM projection pair does not support this input: "
+        "inputs on cpu and cpu, not one CUDA device"
+    )
+    with spy_fused_mhc_ops(module) as spy:
+        if policy == "triton":
+            with pytest.raises(RuntimeError) as error:
+                module._projection_and_get_norm(x)
+            assert str(error.value) == (
+                f"mHC fused backend 'triton' was requested for ['proj_rms'], but {message}."
+            )
+            assert (spy.calls("_glm_proj_rms_op"), spy.unsupported("_glm_proj_rms_op")) == (0, 1)
+            assert warnings_logged == []
+            return
+        actual = module._projection_and_get_norm(x)
+        assert (spy.calls("_glm_proj_rms_op"), spy.unsupported("_glm_proj_rms_op")) == (0, 1)
+        expected_warnings = [
+            (
+                logging.WARNING,
+                "[mHC] Falling back to the unfused path for mhc_fused_ops ['proj_rms']: "
+                f"{message}.",
+            )
+        ]
+        assert warnings_logged == expected_warnings
+        # Once per process.
+        module._projection_and_get_norm(x)
+        assert spy.unsupported("_glm_proj_rms_op") == 2
+        assert warnings_logged == expected_warnings
+    for name, got, want in zip(("proj", "norm"), actual, reference._projection_and_get_norm(x)):
+        assert got.dtype == want.dtype == torch.float32, name
+        assert torch.equal(got.detach().view(torch.int32), want.detach().view(torch.int32)), name
 
 
 def test_per_op_does_not_log_fmk_backend_selection(monkeypatch):
@@ -900,6 +944,11 @@ try:
     glm_kernel_lookup = None
 except Exception as error:
     glm_kernel_lookup = type(error).__name__
+try:
+    glm._glm_kernels()
+    glm_pair_kernel_lookup = None
+except Exception as error:
+    glm_pair_kernel_lookup = type(error).__name__
 all_ops_functions = {
     "_sinkhorn_op": fmk.fused_sinkhorn,
     "_h_aggregate_op": fmk.fused_h_aggregate,
@@ -928,6 +977,7 @@ print(
             "glm_imported_by_modules": glm_imported_by_modules,
             "glm_num_warps": glm.SINKHORN_NUM_WARPS,
             "glm_kernel_lookup": glm_kernel_lookup,
+            "glm_pair_kernel_lookup": glm_pair_kernel_lookup,
         }
     )
 )
@@ -937,7 +987,8 @@ print(
 def test_forced_native_environment_in_fresh_process():
     """The real MHC_FORCE_BACKEND=native, which the fused kernels read once, at import.
 
-    fused_mhc_glm_projection imports there too, and its kernel lookup fails closed.
+    fused_mhc_glm_projection imports there too, and its kernel lookups (the Sinkhorn's and the
+    GLM projection pair's) fail closed.
     """
     result = _run_python(_FORCED_NATIVE_SCRIPT, dict(os.environ, MHC_FORCE_BACKEND="native"))
     assert result["forced_backend"] == "native"
@@ -947,6 +998,7 @@ def test_forced_native_environment_in_fresh_process():
     assert not result["glm_imported_by_modules"]
     assert result["glm_num_warps"] == 1
     assert result["glm_kernel_lookup"] == "RuntimeError"
+    assert result["glm_pair_kernel_lookup"] == "RuntimeError"
     assert result["per_op_labels"] == {
         op: "native(MHC_FORCE_BACKEND=native)" for op in MHC_FUSED_OPS
     }
@@ -1138,7 +1190,7 @@ _PER_OP_FMK_OPS = ["proj_rms", "h_aggregate", "h_post_bda"]
             dict(use_fused_mhc=True, mhc_fused_ops=["proj_rms", "sinkhorn"], **GLM_FLAGS),
             None,
             "mode=per-op policy=auto MHC_FORCE_BACKEND=unset "
-            "proj_rms=native(no per-op implementation) sinkhorn=triton(num_warps=1) "
+            "proj_rms=glm-triton(tf32=rn) sinkhorn=triton(num_warps=1) "
             "h_aggregate=native h_post_bda=native(emulate-casts)",
         ),
         (

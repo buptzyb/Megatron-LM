@@ -23,8 +23,12 @@ epilogue and the split-M wgrad partials, and GP-4r the wgrad reduction. Each MMA
 
 with T() a TF32 operand rounding and the products exact in float64. A ChainPlan holds the kernel's
 splits: each split runs its own chain from acc = 0 in MMA k-steps counted from the split start, and
-the fp32 split partials are added in index order with IEEE round-to-nearest. An AccumModel sets
-the arithmetic of one chain (acc is fp32):
+the fp32 split partials are added in index order with IEEE round-to-nearest. A ColumnChainPlans
+gives each group of output columns its own ChainPlan (the wgrad's pieces per column tile). Two plan
+sets exist: glm_pair_kernel_plans, the P2 prototype's (split-K 16, split-M 2), on which this
+module's P2 tests and power rows were computed, and glm_pair_fused_plans, the shipped kernels'
+(GP-2's non-empty chains, GP-4's per-column wgrad pieces). pair_data draws the tests' inputs. An
+AccumModel sets the arithmetic of one chain (acc is fp32):
 
     exact  the float64 sum of the products, Neumaier-compensated; splits are summed in float64;
     rn     IEEE round-to-nearest per product, acc = fl32(acc + a * b). With rn_block = B a fresh
@@ -63,6 +67,7 @@ EPS_FP32 = 9.999999747378752e-06
 # hyper_connection's _MHC_SINKHORN_EPS and the default mhc_sinkhorn_iterations.
 SINKHORN_EPS, SINKHORN_ITERS = 1e-6, 20
 COMPUTE_H_EPS = 1e-6  # hyper_connection's _MHC_COMPUTE_H_EPS: h_pre = sigmoid(.) + eps
+PAIR_N = 24  # n^2 + 2n mapping outputs at n = 4 residual streams: pair_data's W and G_p width
 # TransformerConfig.mhc_fused_tf32_rounding -> TF32 operand mode. "rn" is RNE here (ties to even),
 # not the RNA (ties away from zero) that some TF32 emulations call "rn".
 CONFIG_ROUNDING_TO_MODE = {"rn": "rne", "rz": "rz"}
@@ -357,6 +362,108 @@ def gp4_wgrad_plan(T: int, n_split: int = 2, block_t: int = 64) -> ChainPlan:
     return _kernel_split_plan(T, n_split, block_t)
 
 
+def gp2_plan_nonempty(K: int, n_split: int = 14, block_k: int = 64) -> ChainPlan:
+    """The shipped GP-2's split-K plan, in which no chain is empty.
+
+    k = cdiv(cdiv(K, n), block_k) * block_k columns per chain, n = min(n_split, cdiv(K, block_k)),
+    and chain i covers [i * k, min((i + 1) * k, K)) for i < cdiv(K, k), so only the last chain can
+    be shorter; GP-3 reduces one partial per chain. K = 16384 gives 13 x 1,216 + 576, K = 4096
+    gives 12 x 320 + 256 and K = 384 gives 6 x 64. gp2_plan(K, 14) has the same non-empty chains
+    followed by empty splits (1 at K = 4096, 8 at K = 384), which could change only the sign of an
+    exactly zero p; this plan has none.
+    """
+    if K < 1 or n_split < 1 or block_k < 1:
+        raise ValueError(f"K, n_split and block_k must be >= 1, got {K}, {n_split} and {block_k}")
+    per_chain = _cdiv(_cdiv(K, min(n_split, _cdiv(K, block_k))), block_k) * block_k
+    return ChainPlan(
+        K, tuple((start, min(start + per_chain, K)) for start in range(0, K, per_chain))
+    )
+
+
+@dataclass(frozen=True)
+class ColumnChainPlans:
+    """Chain plans per group of output columns: one ChainPlan of the contraction for each group.
+
+    groups holds (column ranges, ChainPlan(length, splits)) pairs, one per distinct split layout,
+    in the order of their first column. The column ranges are [start, stop) ranges of output
+    columns (the rows of bt in _accumulate_columns); together they cover [0, width) exactly once.
+    gp4_wgrad_column_plans gives the shipped wgrad's: a group holds the 128-column tiles whose
+    token pieces agree.
+    """
+
+    length: int
+    groups: Tuple[Tuple[Tuple[Tuple[int, int], ...], ChainPlan], ...]
+
+    def __post_init__(self) -> None:
+        groups = tuple(
+            (tuple((int(start), int(stop)) for start, stop in ranges), plan)
+            for ranges, plan in self.groups
+        )
+        object.__setattr__(self, "groups", groups)
+        if self.length < 0 or not groups:
+            raise ValueError(f"column plans need a length >= 0 and at least one group, got {self}")
+        for ranges, plan in groups:
+            if not isinstance(plan, ChainPlan) or plan.length != self.length:
+                raise ValueError(
+                    f"every group needs a ChainPlan of length {self.length}, got {plan}"
+                )
+            if not ranges or any(stop <= start for start, stop in ranges):
+                raise ValueError(f"column ranges {ranges} must be non-empty [start, stop) ranges")
+        position = 0
+        covered = sorted(r for ranges, _ in groups for r in ranges)
+        for start, stop in covered:
+            if start != position:
+                raise ValueError(f"column ranges {covered} do not cover [0, n) exactly once")
+            position = stop
+
+    @property
+    def width(self) -> int:
+        """The number of output columns the groups cover."""
+        return max(stop for ranges, _ in self.groups for _, stop in ranges)
+
+
+def gp4_wgrad_column_plans(
+    T: int, K: int, block_t: int = 64, block_c: int = 128, nprog_max: int = 304
+) -> ColumnChainPlans:
+    """The shipped GP-4 wgrad's token pieces per column tile, from its static partition of the work.
+
+    The NU = NB * NC units u = c * NB + b (token block b of block_t tokens, column tile c of
+    block_c columns; NB = cdiv(T, block_t), NC = cdiv(K, block_c)) are dealt in this column-major
+    order to NPROG = min(nprog_max, NU) programs, program q owning the units from q * NU // NPROG
+    to (q + 1) * NU // NPROG. A piece is one program's run inside one column tile: one chain from
+    acc = 0 over its tokens. Each tile's pieces are in program order, which is token order, and
+    GP-4r adds their partials in that order from +0.0. nprog_max is the kernels' constant 2 x 152;
+    it is never read from a device. At T = 4096, K = 16384, NPROG = 304 gives 8 layouts (tile c
+    takes layout c mod 8) of 3 or 4 pieces of 192-1,728 tokens. Tiles with the same pieces form one
+    group, and adjacent ones share a column range.
+    """
+    sizes = (T, K, block_t, block_c, nprog_max)
+    if min(sizes) < 1:
+        raise ValueError(f"T, K, block_t, block_c and nprog_max must be >= 1, got {sizes}")
+    n_blocks, n_tiles = _cdiv(T, block_t), _cdiv(K, block_c)
+    n_units = n_blocks * n_tiles
+    n_prog = min(nprog_max, n_units)
+    pieces: List[List[Tuple[int, int]]] = [[] for _ in range(n_tiles)]
+    for q in range(n_prog):
+        unit, unit_end = q * n_units // n_prog, (q + 1) * n_units // n_prog
+        while unit < unit_end:  # the program's run, cut at column tile boundaries
+            tile, block = divmod(unit, n_blocks)
+            block_end = min(unit_end - tile * n_blocks, n_blocks)
+            pieces[tile].append((block * block_t, min(block_end * block_t, T)))
+            unit = tile * n_blocks + block_end
+    layouts: Dict[Tuple[Tuple[int, int], ...], List[Tuple[int, int]]] = {}
+    for tile, tile_pieces in enumerate(pieces):
+        ranges = layouts.setdefault(tuple(tile_pieces), [])
+        start, stop = tile * block_c, min((tile + 1) * block_c, K)
+        if ranges and ranges[-1][1] == start:
+            ranges[-1] = (ranges[-1][0], stop)
+        else:
+            ranges.append((start, stop))
+    return ColumnChainPlans(
+        T, tuple((tuple(ranges), ChainPlan(T, layout)) for layout, ranges in layouts.items())
+    )
+
+
 def _chain(a_s: Tensor, b_s: Tensor, model: AccumModel) -> Tensor:
     """One row chunk. a_s: [..., Mc, S, L], b_s: [..., N, S, L] (float64). Returns [..., Mc, N]."""
     seg_len = a_s.shape[-1]
@@ -473,6 +580,48 @@ def accumulate(
     return _accumulate_split_loop(a64, bt64, model, plan, max_chunk_elems)
 
 
+def _accumulate_columns(
+    a64: Tensor,
+    bt64: Tensor,
+    model: AccumModel,
+    plans: ColumnChainPlans,
+    *,
+    drop_last_split: bool = False,
+    max_chunk_elems: int = DEFAULT_MAX_CHUNK_ELEMS,
+) -> Tensor:
+    """The per-column path of _contract (g_W only): accumulate with each group of output columns
+    (rows of bt64) on its own ChainPlan.
+
+    Per group: accumulate over the group's columns, one chain per split from acc = 0 and the split
+    partials added in index order from +0.0 (ordered_reduce). With drop_last_split, each group's
+    last split contributes zero products: a kernel that never reduces the last piece of a column
+    tile. Takes and returns what accumulate takes and returns.
+    """
+    if not isinstance(model, AccumModel) or not isinstance(plans, ColumnChainPlans):
+        raise TypeError("_accumulate_columns expects an AccumModel and a ColumnChainPlans")
+    if a64.dtype != torch.float64 or bt64.dtype != torch.float64:
+        raise TypeError("_accumulate_columns expects float64 operands (use round_operand)")
+    n_columns = bt64.shape[-2]
+    if plans.width != n_columns:
+        raise ValueError(f"the plans cover {plans.width} output columns; bt has {n_columns}")
+    batch = torch.broadcast_shapes(a64.shape[:-2], bt64.shape[:-2])
+    out_dtype = torch.float64 if model.kind == "exact" else torch.float32
+    out = torch.empty(tuple(batch) + (a64.shape[-2], n_columns), dtype=out_dtype, device=a64.device)
+    for ranges, plan in plans.groups:
+        columns = torch.cat(
+            [torch.arange(start, stop, device=bt64.device) for start, stop in ranges]
+        )
+        a_group = a64
+        if drop_last_split:
+            start, stop = plan.splits[-1]
+            a_group = a64.clone()
+            a_group[..., start:stop] = 0.0
+        out[..., columns] = accumulate(
+            a_group, bt64.index_select(-2, columns), model, plan, max_chunk_elems=max_chunk_elems
+        )
+    return out
+
+
 def emulate(a: Tensor, bt: Tensor, model: AccumModel, operand_mode: str, plan: ChainPlan) -> Tensor:
     """Round both operands with operand_mode, then accumulate.
 
@@ -489,16 +638,30 @@ def emulate(a: Tensor, bt: Tensor, model: AccumModel, operand_mode: str, plan: C
 
 @dataclass(frozen=True)
 class GLMPairPlans:
-    """The chain plans of the projection pair: proj over K, dgrad over N and wgrad over T."""
+    """The chain plans of the projection pair: proj over K, dgrad over N and wgrad over T.
+
+    wgrad alone may be a ColumnChainPlans, whose column groups are columns of g_W.
+    """
 
     proj: ChainPlan
     dgrad: ChainPlan
-    wgrad: ChainPlan
+    wgrad: Union[ChainPlan, ColumnChainPlans]
 
 
 def glm_pair_kernel_plans(T: int, K: int, N: int = 24) -> GLMPairPlans:
-    """The fused kernels' plans: GP-2's split-K, GP-4's single dgrad chain and split-M wgrad."""
+    """The P2 prototype's plans: GP-2's split-K, GP-4's single dgrad chain and split-M wgrad.
+
+    The shipped kernels' plans are glm_pair_fused_plans.
+    """
     return GLMPairPlans(proj=gp2_plan(K), dgrad=single_chain(N), wgrad=gp4_wgrad_plan(T))
+
+
+def glm_pair_fused_plans(T: int, K: int, N: int = 24) -> GLMPairPlans:
+    """The shipped fused kernels' plans: GP-2's non-empty split-K chains (gp2_plan_nonempty), GP-4's
+    single dgrad chain over N and its wgrad pieces per column tile (gp4_wgrad_column_plans)."""
+    return GLMPairPlans(
+        proj=gp2_plan_nonempty(K), dgrad=single_chain(N), wgrad=gp4_wgrad_column_plans(T, K)
+    )
 
 
 @dataclass
@@ -535,6 +698,32 @@ GLM_PAIR_MUTATIONS = (
 )
 _S_MUTATIONS = ("eps_outside_sqrt",)
 _P_MUTATIONS = ("project_first", "rz_for_rn", "bf16_p", "drop_kernel_split", "ignore_kernel_split")
+
+
+def pair_data(T, K, scale=1.0, seed=0, rows="randn"):
+    """x randn -> bf16 [T, K], W xavier-uniform [24, K] (HyperConnectionModule's init), G_p randn.
+
+    rows="heavy" puts 4 channels of magnitude 100-1000 (log-uniform, random sign) in every row, one
+    per quarter of K; rows="zero_rows" zeroes every 8th row, where s = rsqrt(eps) ~ 316.
+    """
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(T, K, generator=g) * scale
+    if rows == "heavy":
+        quarter = K // 4
+        for row in range(T):
+            columns = torch.randint(quarter, (4,), generator=g) + torch.arange(4) * quarter
+            magnitudes = torch.exp(
+                torch.empty(4).uniform_(math.log(100), math.log(1000), generator=g)
+            )
+            signs = torch.randint(2, (4,), generator=g) * 2 - 1
+            x[row, columns] = magnitudes * signs
+    elif rows == "zero_rows":
+        x[::8] = 0.0
+    x = x.to(torch.bfloat16)
+    bound = math.sqrt(6.0 / (K + PAIR_N))
+    W = (torch.rand(PAIR_N, K, generator=g) * 2 - 1) * bound
+    G_p = torch.randn(T, PAIR_N, generator=g)
+    return x, W, G_p
 
 
 def _check_pair_inputs(
@@ -630,11 +819,15 @@ def _contract(
     a_mode: str,
     b_mode: str,
     model: AccumModel,
-    plan: ChainPlan,
+    plan: Union[ChainPlan, ColumnChainPlans],
     drop_last_split: bool = False,
 ) -> Tensor:
     a64 = round_operand(a.contiguous(), a_mode)
     b64 = round_operand(bt.contiguous(), b_mode)
+    if isinstance(plan, ColumnChainPlans):
+        # The per-column path (g_W only): each column group's own splits, its last split dropped
+        # for every column tile under drop_last_split.
+        return _accumulate_columns(a64, b64, model, plan, drop_last_split=drop_last_split)
     if drop_last_split:
         # A kernel that never reduces the last split's partial: zero products make that partial
         # +0, and adding +0 in the ordered reduction changes no value.
@@ -672,12 +865,16 @@ def glm_pair_kernel_model(
     O7   coef = fl(fl(fl(fl(s * s) * s) * inv_k) * g_s), with inv_k = fl32(1 / K);
     O8   g_x32 = fl(fl(s * g_xn) - fl(coef * xf)), without FMA (enable_fp_fusion=False);
     O9   g_x = bf16_RNE(g_x32);
-    O10  g_W = the chains of T(G_p)^T, T(xn)^T over plans.wgrad, then O4.
+    O10  g_W = the chains of T(G_p)^T, T(xn)^T over plans.wgrad, then O4; a ColumnChainPlans
+         wgrad runs each column group on its own splits (_accumulate_columns).
 
     x is bf16 [T, K], W fp32 [N, K], G_p fp32 [T, N] and G_s fp32 [T]. Without G_p (the norm-only
     case) g_xn and g_W are None and g_x comes from G_s alone. One ulp of s on one row in 16 moves p
-    by 6-25 x its bar, so emulator agreement needs GP-1's s and GP-3's p as inputs. mutation, one
-    of GLM_PAIR_MUTATIONS, changes one step for the power checks.
+    by 6-25 x its bar, so emulator agreement needs GP-1's s and GP-3's p as inputs. plans default to
+    glm_pair_kernel_plans (P2's); the shipped kernels' are glm_pair_fused_plans. mutation, one of
+    GLM_PAIR_MUTATIONS, changes one step for the power checks. On a ColumnChainPlans wgrad,
+    drop_kernel_split zeroes the last piece of every column tile and ignore_kernel_split runs one
+    chain over T for every column.
     """
     if x.dtype != torch.bfloat16 or W.dtype != torch.float32:
         raise TypeError(f"expected bf16 x and fp32 W, got {x.dtype} and {W.dtype}")
@@ -697,9 +894,14 @@ def glm_pair_kernel_model(
     elif mutation == "dgrad_unrounded_w":
         modes["W_dgrad"] = "rz"
     plans = plans if plans is not None else glm_pair_kernel_plans(T, K, N)
+    if isinstance(plans.proj, ColumnChainPlans) or isinstance(plans.dgrad, ColumnChainPlans):
+        raise TypeError("only the wgrad plan may be a ColumnChainPlans (per column of g_W)")
     if (plans.proj.length, plans.dgrad.length, plans.wgrad.length) != (K, N, T):
         raise ValueError(f"plans {plans} do not cover K={K}, N={N} and T={T}")
+    if isinstance(plans.wgrad, ColumnChainPlans) and plans.wgrad.width != K:
+        raise ValueError(f"the wgrad plans cover {plans.wgrad.width} columns of g_W, not K={K}")
     if mutation == "ignore_kernel_split":
+        # One chain over T for every column of g_W, whether wgrad is per column or not.
         plans = GLMPairPlans(proj=single_chain(K), dgrad=plans.dgrad, wgrad=single_chain(T))
     drop_split = mutation == "drop_kernel_split"
 
@@ -767,8 +969,9 @@ def glm_mappings_chain_f64(
     [n^2 + 2n] and grads holds the gradients (G_pre [T, n], G_post [T, n], G_res [T, n, n]) of the
     three outputs. The backward takes the sigmoid derivatives, the Sinkhorn VJP,
     d_alpha_g = sum G_h * p over each group, d_bias = sum_t G_h and G_p = G_h * alpha_, then the
-    pair's backward (G_s = 0: that branch does not use the norm). Returns the three outputs and
-    every gradient.
+    pair's backward (G_s = 0: that branch does not use the norm). Returns the three outputs,
+    every gradient, and p and G_h (float64 [T, n^2 + 2n]): the factors of the contributions G_h * p,
+    whose sums over the column groups are the three d_alpha values.
     """
     T = x.shape[0]
     alpha_pre, alpha_post, alpha_res = (
@@ -800,6 +1003,8 @@ def glm_mappings_chain_f64(
         "d_alpha_post": weighted[:, n : 2 * n].sum(),
         "d_alpha_res": weighted[:, 2 * n :].sum(),
         "d_bias": G_h.sum(dim=0),
+        "p": p,
+        "G_h": G_h,
     }
 
 

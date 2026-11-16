@@ -654,9 +654,8 @@ class HyperConnectionModule(MegatronModule):
             eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt,
             normalize_before_projection=config.mhc_normalize_before_projection,
         )
-        # The Triton GLM projection pair, which per-op proj_rms selects with
-        # mhc_norm_eps_inside_sqrt and mhc_normalize_before_projection. It is not implemented
-        # yet, so it stays None.
+        # The Triton GLM projection pair (fused_mhc_glm_projection), which per-op proj_rms binds
+        # with mhc_norm_eps_inside_sqrt and mhc_normalize_before_projection; None everywhere else.
         self._glm_proj_rms_op = None
 
         if config.use_fused_mhc and config.mhc_fused_ops is None:
@@ -721,8 +720,12 @@ class HyperConnectionModule(MegatronModule):
         Triton is available; under ``auto`` without Triton it keeps the unfused object, with a
         warning. Triton counts as unavailable also under ``MHC_DISABLE_TRITON=1`` and
         ``MHC_FORCE_BACKEND=cutile``. proj_rms with ``mhc_norm_eps_inside_sqrt`` and
-        ``mhc_normalize_before_projection`` has no per-op implementation in this build: it keeps
-        the unfused object under ``auto`` and fails under ``triton``.
+        ``mhc_normalize_before_projection`` binds the Triton GLM projection pair of
+        fused_mhc_glm_projection when Triton is available, with the TF32 rounding of
+        ``mhc_fused_tf32_rounding``; under ``auto`` without Triton it keeps the unfused object,
+        with a warning. At call time the pair runs only on inputs it supports; on any other input
+        the module warns once and runs the unfused projection under ``auto``, and raises under
+        ``triton``.
         """
         # Configs edited after TransformerConfig validation. The table needs a well-formed
         # list, so it runs only when the field checks pass.
@@ -746,7 +749,7 @@ class HyperConnectionModule(MegatronModule):
         if policy == "native":
             return {op: "native(mhc_fused_backend=native)" for op in config.mhc_fused_ops}
 
-        labels, missing, unavailable = {}, [], []
+        labels, unavailable = {}, []
         fmk_labels = _fmk_op_labels(policy, MHC_FUSED_OPS)
         for op in MHC_FUSED_OPS:
             if op not in config.mhc_fused_ops:
@@ -765,11 +768,18 @@ class HyperConnectionModule(MegatronModule):
                     unavailable.append(op)
                 continue
             if op in triton_only_ops(config):
-                # The Triton GLM projection pair is not implemented yet, so proj_rms with
-                # mhc_norm_eps_inside_sqrt and mhc_normalize_before_projection keeps its unfused
-                # object.
-                labels[op] = "native(no per-op implementation)"
-                missing.append(op)
+                # proj_rms with mhc_norm_eps_inside_sqrt and mhc_normalize_before_projection
+                # (sinkhorn continued above): the Triton GLM projection pair, Triton-only like the
+                # Sinkhorn. The policy is auto or triton here.
+                if fmk.is_triton_available():
+                    # Lazy: the file imports fused_mhc_kernels, which imports this module.
+                    from megatron.core.fusions import fused_mhc_glm_projection as glm
+
+                    self._glm_proj_rms_op = glm.glm_proj_rms_op(config.mhc_fused_tf32_rounding)
+                    labels[op] = self._glm_proj_rms_op.label
+                else:
+                    labels[op] = "native(triton unavailable)"
+                    unavailable.append(op)
                 continue
             if op == "proj_rms":
                 self._proj_rms_compute_h_op = partial(fmk.fused_proj_rms_compute_h, backend=policy)
@@ -780,13 +790,6 @@ class HyperConnectionModule(MegatronModule):
                 self._h_post_bda_op = partial(fmk.fused_h_post_bda, backend=policy)
             labels[op] = fmk_labels[op]
 
-        if missing and policy == "triton":
-            raise RuntimeError(
-                f"mHC fused backend 'triton' was requested for {missing}, but this build has no "
-                "Triton per-op implementation for them."
-            )
-        if missing:
-            _warn_per_op_fallback_once(missing, "no per-op implementation in this build")
         if unavailable:
             _warn_per_op_fallback_once(unavailable, "Triton is unavailable")
         return labels
@@ -821,6 +824,14 @@ class HyperConnectionModule(MegatronModule):
         # projection. This avoids retaining a full FP32 copy of the residual stream.
         x_2d = x.reshape(s * b, nC)
         weight = self.mapping_proj.weight
+        glm_op = self._glm_proj_rms_op
+        if glm_op is not None:
+            # Before the checkpoint below, so that a full-recompute forward under no_grad and its
+            # replay run the same op; asked through the attribute, so that the spy counts refusals.
+            if glm_op.supported(x_2d, weight):
+                proj, r = glm_op(x_2d, weight, self.norm_eps)
+                return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
+            self._refuse_glm_proj_rms(glm_op.refusal(x_2d, weight))
         if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
             proj, r = checkpoint(
                 self._proj_rms_op,
@@ -833,6 +844,16 @@ class HyperConnectionModule(MegatronModule):
         else:
             proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
+
+    def _refuse_glm_proj_rms(self, reason: str) -> None:
+        """An explicit triton policy fails; auto warns once per reason and runs the unfused
+        projection."""
+        message = f"the Triton GLM projection pair does not support this input: {reason}"
+        if self.config.mhc_fused_backend == "triton":
+            raise RuntimeError(
+                f"mHC fused backend 'triton' was requested for ['proj_rms'], but {message}."
+            )
+        _warn_per_op_fallback_once(["proj_rms"], message)
 
     # Static shapes: see _compute_h_one_specialization.
     @torch.compile(dynamic=False)

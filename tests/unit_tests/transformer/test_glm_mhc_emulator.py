@@ -4,10 +4,13 @@
 
 They pin the TF32 bit helpers to an integer oracle, the exact modes to float64 autograd, the
 accumulation models to an exact-rational oracle and to outputs measured on GB300 (sm_103) hardware,
-the split plans to the fused kernels' rule, and every mutation to its power threshold.
+the split plans to the P2 prototype's rule and to the shipped kernels' chains and per-column pieces,
+and every mutation to its power threshold.
 """
 
 import dataclasses
+import functools
+import hashlib
 import math
 import os
 import random
@@ -30,23 +33,30 @@ from tests.unit_tests.transformer.glm_mhc_emulator import (
     OPERAND_SLOTS,
     P9_M3_BARS,
     P9_POWER_THRESHOLDS,
+    PAIR_N,
     R01_ALIGN_K8_X0,
     RZ_K8,
     TF32_MODES,
     AccumModel,
     ChainPlan,
+    ColumnChainPlans,
     GLMPairPlans,
+    _accumulate_columns,
     _accumulate_split_loop,
     accumulate,
     emulate,
     glm_mappings_chain_f64,
+    glm_pair_fused_plans,
     glm_pair_kernel_model,
     glm_pair_kernel_plans,
     glm_pair_reference_f64,
     gp1_s_model,
     gp2_plan,
+    gp2_plan_nonempty,
+    gp4_wgrad_column_plans,
     gp4_wgrad_plan,
     ordered_reduce,
+    pair_data,
     rel_rms,
     round_operand,
     rz_to_fp32,
@@ -61,6 +71,9 @@ from tests.unit_tests.transformer.glm_mhc_emulator import (
 
 _N = 24  # n^2 + 2n mapping outputs at n = 4 residual streams
 _U = 2.0**-23  # the fp32 ulp of 1.0
+# The inputs of every pair case: x bf16 [T, K], W fp32 [24, K] and G_p fp32 [T, 24]. The kernels'
+# GPU tests draw theirs with the same function.
+_pair_data = pair_data
 
 
 def _fl32(value: float) -> float:
@@ -76,32 +89,6 @@ def _patterns_to_fp32(patterns):
     return torch.tensor(
         [bits - (1 << 32) if bits >= 1 << 31 else bits for bits in patterns], dtype=torch.int32
     ).view(torch.float32)
-
-
-def _pair_data(T, K, scale=1.0, seed=0, rows="randn"):
-    """x randn -> bf16 [T, K], W xavier-uniform [24, K] (HyperConnectionModule's init), G_p randn.
-
-    rows="heavy" puts 4 channels of magnitude 100-1000 (log-uniform, random sign) in every row, one
-    per quarter of K; rows="zero_rows" zeroes every 8th row, where s = rsqrt(eps) ~ 316.
-    """
-    g = torch.Generator().manual_seed(seed)
-    x = torch.randn(T, K, generator=g) * scale
-    if rows == "heavy":
-        quarter = K // 4
-        for row in range(T):
-            columns = torch.randint(quarter, (4,), generator=g) + torch.arange(4) * quarter
-            magnitudes = torch.exp(
-                torch.empty(4).uniform_(math.log(100), math.log(1000), generator=g)
-            )
-            signs = torch.randint(2, (4,), generator=g) * 2 - 1
-            x[row, columns] = magnitudes * signs
-    elif rows == "zero_rows":
-        x[::8] = 0.0
-    x = x.to(torch.bfloat16)
-    bound = math.sqrt(6.0 / (K + _N))
-    W = (torch.rand(_N, K, generator=g) * 2 - 1) * bound
-    G_p = torch.randn(T, _N, generator=g)
-    return x, W, G_p
 
 
 def _hf_pair_autograd(x, W, G_p, G_s):
@@ -298,9 +285,8 @@ def _hf_mappings_autograd(x, W, alpha, bias, grads, n=4):
     return {**{name: t.detach() for name, t in outputs.items()}, **dict(zip(names, gradients))}
 
 
-@pytest.mark.parametrize("case", list(_CHAIN_CASES))
-def test_glm_mappings_chain_exact_matches_autograd(case, request):
-    """The analytic chain equals float64 autograd: tensors <= 1e-10, the alpha scalars <= 1e-8."""
+def _chain_inputs(case, request):
+    """x, W, alpha, bias and grads of a _CHAIN_CASES case (T = 4096 runs as a heavy CPU case)."""
     T, K, scale = _CHAIN_CASES[case]
     if T >= 4096:
         request.getfixturevalue("heavy_cpu_case")
@@ -312,6 +298,13 @@ def test_glm_mappings_chain_exact_matches_autograd(case, request):
         torch.randn(shape, generator=g, dtype=torch.float64)
         for shape in ((T, 4), (T, 4), (T, 4, 4))
     )
+    return x, W, alpha, bias, grads
+
+
+@pytest.mark.parametrize("case", list(_CHAIN_CASES))
+def test_glm_mappings_chain_exact_matches_autograd(case, request):
+    """The analytic chain equals float64 autograd: tensors <= 1e-10, the alpha scalars <= 1e-8."""
+    x, W, alpha, bias, grads = _chain_inputs(case, request)
 
     result = glm_mappings_chain_f64(x, W, alpha, bias, grads)
     reference = _hf_mappings_autograd(x, W, alpha, bias, grads)
@@ -320,6 +313,24 @@ def test_glm_mappings_chain_exact_matches_autograd(case, request):
     for name in ("d_alpha_pre", "d_alpha_post", "d_alpha_res"):
         got, want = result[name].item(), reference[name].item()
         assert abs(got - want) <= 1e-8 * abs(want), (name, got, want)
+
+
+@pytest.mark.parametrize("case", list(_CHAIN_CASES))
+def test_glm_mappings_chain_returns_contributions(case, request):
+    """The chain also returns p and G_h (float64 [T, 24]): G_h * p summed over each column group is
+    d_alpha_pre, d_alpha_post and d_alpha_res bitwise, and G_h summed over T is d_bias, so a module
+    test can score each alpha gradient through its contribution tensor instead of one scalar."""
+    x, W, alpha, bias, grads = _chain_inputs(case, request)
+    T = x.shape[0]
+
+    result = glm_mappings_chain_f64(x, W, alpha, bias, grads)
+    for name in ("p", "G_h"):
+        assert result[name].dtype == torch.float64 and tuple(result[name].shape) == (T, _N), name
+    assert torch.equal(result["p"], glm_pair_reference_f64(x, W).p)
+    contributions = result["G_h"] * result["p"]
+    for name, columns in (("pre", slice(0, 4)), ("post", slice(4, 8)), ("res", slice(8, _N))):
+        assert torch.equal(contributions[:, columns].sum(), result[f"d_alpha_{name}"]), name
+    assert torch.equal(result["G_h"].sum(dim=0), result["d_bias"])
 
 
 def _sinkhorn_data(scale, T=4096, n=4, seed=7):
@@ -767,6 +778,172 @@ def test_kernel_split_plans_follow_p2_rules(shape):
     )
 
 
+# The shipped kernels' plans, pinned to the values the M3 registration recorded for its 15 shapes (T
+# in {4096, 4095, 112, 21, 17}, K in {16384, 4096, 384}) and its fixture shapes.
+# K -> gp2_plan_nonempty(K)'s chain lengths: the K values of both.
+_NONEMPTY_PLAN_SHAPES = {
+    "K16384": (16384, [1216] * 13 + [576]),
+    "K4096": (4096, [320] * 12 + [256]),
+    "K512": (512, [64] * 8),
+    "K384": (384, [64] * 6),
+    "K128": (128, [64] * 2),
+}
+# K -> the empty splits of gp2_plan(K, 14), which gp2_plan_nonempty drops: 14 minus its chains. The
+# registration states 1 at K = 4096 and 8 at K = 384; 0, 6 and 12 follow from the chain counts
+# above.
+_EMPTY_SPLITS_DROPPED = {16384: 0, 4096: 1, 512: 6, 384: 8, 128: 12}
+
+
+@pytest.mark.parametrize("shape", list(_NONEMPTY_PLAN_SHAPES))
+def test_gp2_plan_nonempty_pins(shape):
+    """GP-2's shipped chains: k = cdiv(cdiv(K, n), 64) * 64 with n = min(14, cdiv(K, 64)), chains
+    [i * k, min((i + 1) * k, K)) for i < cdiv(K, k), none empty; gp2_plan(K, 14) has the same
+    non-empty chains, followed by its empty splits (none at K = 16384, 1 at 4096, 6 at 512, 8 at
+    384 and 12 at 128)."""
+    K, chain_lengths = _NONEMPTY_PLAN_SHAPES[shape]
+    plan = gp2_plan_nonempty(K)
+    assert [stop - start for start, stop in plan.splits] == chain_lengths
+    n = min(14, math.ceil(K / 64))
+    per = math.ceil(math.ceil(K / n) / 64) * 64
+    assert plan.splits == tuple((i * per, min((i + 1) * per, K)) for i in range(math.ceil(K / per)))
+    p2_form = gp2_plan(K, 14)
+    assert tuple((start, stop) for start, stop in p2_form.splits if stop > start) == plan.splits
+    empty = sum(stop == start for start, stop in p2_form.splits)
+    assert empty == _EMPTY_SPLITS_DROPPED[K] == 14 - len(chain_lengths)
+
+
+# (T, K) -> (layouts, pieces per column tile (fewest, most), tokens per piece (fewest, most), NPROG,
+# pieces in all or None where not recorded): gp4_wgrad_column_plans at the 15 M3 shapes and the
+# fixture shapes. The registration derived all of them from the round-2 kernel's partition rule;
+# at the 15 M3 shapes it checked them against round 2's recorded per-shape splits, while the 7
+# fixture shapes were never run on a GPU (it records their layouts and pieces per tile; their
+# tokens per piece and NPROG = min(304, NU) follow from the same rule).
+_COLUMN_PLAN_SHAPES = {
+    "T4096_K16384": (4096, 16384, 8, (3, 4), (192, 1728), 304, 416),
+    "T4096_K4096": (4096, 4096, 2, (10, 10), (192, 448), 304, 320),
+    "T4096_K384": (4096, 384, 1, (64, 64), (64, 64), 192, 192),
+    "T4095_K16384": (4095, 16384, 8, (3, 4), (192, 1728), 304, 416),
+    "T4095_K4096": (4095, 4096, 2, (10, 10), (192, 448), 304, 320),
+    "T4095_K384": (4095, 384, 1, (64, 64), (63, 64), 192, 192),
+    "T112_K16384": (112, 16384, 1, (2, 2), (48, 64), 256, 256),
+    "T112_K4096": (112, 4096, 1, (2, 2), (48, 64), 64, 64),
+    "T112_K384": (112, 384, 1, (2, 2), (48, 64), 6, 6),
+    "T21_K16384": (21, 16384, 1, (1, 1), (21, 21), 128, 128),
+    "T21_K4096": (21, 4096, 1, (1, 1), (21, 21), 32, 32),
+    "T21_K384": (21, 384, 1, (1, 1), (21, 21), 3, 3),
+    "T17_K16384": (17, 16384, 1, (1, 1), (17, 17), 128, 128),
+    "T17_K4096": (17, 4096, 1, (1, 1), (17, 17), 32, 32),
+    "T17_K384": (17, 384, 1, (1, 1), (17, 17), 3, 3),
+    "T520_K16384": (520, 16384, 4, (3, 3), (8, 256), 304, None),
+    "T256_K512": (256, 512, 1, (4, 4), (64, 64), 16, None),
+    "T64_K16384": (64, 16384, 1, (1, 1), (64, 64), 128, None),
+    "T64_K384": (64, 384, 1, (1, 1), (64, 64), 3, None),
+    "T16_K16384": (16, 16384, 1, (1, 1), (16, 16), 128, None),
+    "T16_K128": (16, 128, 1, (1, 1), (16, 16), 1, None),
+    "T8_K512": (8, 512, 1, (1, 1), (8, 8), 4, None),
+}
+
+
+def _tile_pieces(plans, block_c=128):
+    """The token pieces (splits) of every block_c-column tile, in column order."""
+    tiles = {}
+    for ranges, plan in plans.groups:
+        for start, stop in ranges:
+            assert start % block_c == 0 and (stop % block_c == 0 or stop == plans.width)
+            for column in range(start, stop, block_c):
+                tiles[column // block_c] = plan.splits
+    return [tiles[tile] for tile in range(len(tiles))]
+
+
+@pytest.mark.parametrize("shape", list(_COLUMN_PLAN_SHAPES))
+def test_gp4_wgrad_column_plans_pins(shape):
+    """GP-4's shipped wgrad pieces: per 128-column tile, the runs of the static partition of the
+    NU = cdiv(T, 64) x cdiv(K, 128) column-major units over NPROG = min(304, NU) programs, in
+    program order. Layouts, pieces and their lengths are the recorded values; the pieces start
+    exactly at the programs' first units and at the tiles' first units, which pins NPROG wherever a
+    tile has more than one token block (with one block per tile every unit starts a tile, and the
+    pieces do not depend on NPROG). glm_pair_fused_plans is gp2_plan_nonempty, one dgrad chain over
+    N and these pieces."""
+    T, K, layouts, pieces, tokens, nprog, npieces = _COLUMN_PLAN_SHAPES[shape]
+    plans = gp4_wgrad_column_plans(T, K)
+    assert isinstance(plans, ColumnChainPlans) and (plans.length, plans.width) == (T, K)
+    tiles = _tile_pieces(plans)
+    assert len(tiles) == math.ceil(K / 128)
+    assert len(plans.groups) == len(set(tiles)) == layouts
+    assert (min(map(len, tiles)), max(map(len, tiles))) == pieces
+    lengths = [stop - start for splits in tiles for start, stop in splits]
+    assert (min(lengths), max(lengths)) == tokens
+    assert npieces is None or len(lengths) == npieces
+    n_blocks = math.ceil(T / 64)
+    n_units = n_blocks * len(tiles)
+    assert all(start % 64 == 0 for splits in tiles for start, _ in splits)
+    piece_starts = {
+        tile * n_blocks + start // 64 for tile, splits in enumerate(tiles) for start, _ in splits
+    }
+    program_starts = {q * n_units // nprog for q in range(nprog)}
+    assert piece_starts == program_starts | {tile * n_blocks for tile in range(len(tiles))}
+    assert glm_pair_fused_plans(T, K) == GLMPairPlans(
+        proj=gp2_plan_nonempty(K), dgrad=single_chain(_N), wgrad=plans
+    )
+    assert PAIR_N == _N
+
+
+# The 8 layouts at T = 4096, K = 16384 (piece boundaries; tile c takes layout c mod 8), checked by
+# hand against the round-2 kernel's partition: tile 0 takes programs 0-2, whose first units are 0,
+# 26 and 53 of 64 per tile (8192 units over 304 programs: 26.95 units per program).
+_PRODUCTION_LAYOUTS = (
+    (0, 1664, 3392, 4096),
+    (0, 1024, 2752, 4096),
+    (0, 384, 2112, 3840, 4096),
+    (0, 1472, 3200, 4096),
+    (0, 832, 2560, 4096),
+    (0, 192, 1920, 3648, 4096),
+    (0, 1280, 3008, 4096),
+    (0, 640, 2368, 4096),
+)
+
+
+def test_gp4_wgrad_column_plans_production_layouts():
+    """At production every 8th tile shares a layout: 8 groups of 16 tiles in the order of their
+    first tile, with the pieces above. T = 4095 has the same partition, its last piece one token
+    shorter."""
+    for T in (4096, 4095):
+        plans = gp4_wgrad_column_plans(T, 16384)
+        assert len(plans.groups) == len(_PRODUCTION_LAYOUTS)
+        for layout, ((ranges, plan), bounds) in enumerate(zip(plans.groups, _PRODUCTION_LAYOUTS)):
+            assert ranges == tuple((c * 128, (c + 1) * 128) for c in range(layout, 128, 8))
+            assert plan.splits == tuple(zip(bounds[:-1], bounds[1:-1] + (T,)))
+
+
+def test_column_chain_plans_reject_inconsistent_groups():
+    """ColumnChainPlans' columns must cover [0, width) once and its plans share one length; the
+    kernel model takes one for wgrad only, and one that covers K."""
+    pieces = ChainPlan(64, ((0, 32), (32, 64)))
+    plans = ColumnChainPlans(
+        64, ((((0, 128), (256, 384)), pieces), (((128, 256),), single_chain(64)))
+    )
+    assert plans.width == 384
+    for groups in (
+        ((((0, 128), (192, 384)), pieces), (((128, 256),), single_chain(64))),  # overlap
+        ((((0, 128), (256, 384)), pieces),),  # gap
+        ((((0, 128),), pieces), (((128, 256),), single_chain(32))),  # another length
+        ((((0, 128), (128, 128)), pieces),),  # empty range
+    ):
+        with pytest.raises(ValueError):
+            ColumnChainPlans(64, groups)
+    x, W, G_p = _pair_data(64, 384, seed=9)
+    fused = glm_pair_fused_plans(64, 384)
+    for wrong in (  # column plans that would otherwise run, for p and for g_xn
+        dataclasses.replace(fused, proj=ColumnChainPlans(384, ((((0, _N),), fused.proj),))),
+        dataclasses.replace(fused, dgrad=ColumnChainPlans(_N, ((((0, 384),), fused.dgrad),))),
+    ):
+        with pytest.raises(TypeError):
+            glm_pair_kernel_model(x, W, G_p, plans=wrong)
+    narrow = dataclasses.replace(fused, wgrad=gp4_wgrad_column_plans(64, 256))
+    with pytest.raises(ValueError):
+        glm_pair_kernel_model(x, W, G_p, plans=narrow)
+
+
 def _pad_splits(a64, bt64, plan):
     """Pad each split with zero products after its last real k-step, to one length."""
     width = max(stop - start for start, stop in plan.splits)
@@ -863,6 +1040,157 @@ def test_unequal_and_empty_splits_run(shape):
     reference = glm_pair_reference_f64(x, W, G_p)
     for name in ("p", "g_xn", "g_W"):
         assert rel_rms(getattr(result, name), getattr(reference, name)) <= 1e-3, name
+
+
+def _wgrad_operands(T, K):
+    """The rounded wgrad operands T(G_p^T) [24, T] and T(xn^T) [K, T] of pair_data (seed 0)."""
+    x, _, G_p = _pair_data(T, K)
+    xn = x.float() * gp1_s_model(x)[:, None]
+    return round_operand(G_p.t().contiguous(), "rne"), round_operand(xn.t().contiguous(), "rne")
+
+
+def _per_piece_wgrad(a64, bt64, plans, drop_last=False):
+    """The definition of the per-column wgrad: for every 128-column tile, accumulate over each of
+    its pieces as one chain, then ordered_reduce of the piece partials in index order from +0.0."""
+    out = torch.empty(a64.shape[0], bt64.shape[0], dtype=torch.float32)
+    for tile, pieces in enumerate(_tile_pieces(plans)):
+        columns = slice(tile * 128, min((tile + 1) * 128, bt64.shape[0]))
+        partials = []
+        for index, (start, stop) in enumerate(pieces):
+            a_piece = a64[:, start:stop].contiguous()
+            if drop_last and index == len(pieces) - 1:
+                a_piece = torch.zeros_like(a_piece)
+            b_piece = bt64[columns, start:stop].contiguous()
+            partials.append(accumulate(a_piece, b_piece, ALIGN_K8_X2, single_chain(stop - start)))
+        out[:, columns] = ordered_reduce(torch.stack(partials))
+    return out
+
+
+@pytest.fixture(scope="module")
+def production_wgrad():
+    """g_W at T = 4096, K = 16384 (pair_data seed 0) on the shipped per-column plan ("fused") and as
+    one chain over T per column ("one_chain"), computed once for this module's tests."""
+    cache = {}
+
+    def emulation(kind):
+        if kind not in cache:
+            a64, bt64 = _wgrad_operands(4096, 16384)
+            if kind == "fused":
+                plans = glm_pair_fused_plans(4096, 16384).wgrad
+                cache[kind] = _accumulate_columns(a64, bt64, ALIGN_K8_X2, plans)
+            else:
+                cache[kind] = accumulate(a64, bt64, ALIGN_K8_X2, single_chain(4096))
+        return cache[kind]
+
+    yield emulation
+    cache.clear()
+
+
+def _sha256_16(tensor):
+    """The first 16 hex digits of the sha256 of a tensor's bytes."""
+    return hashlib.sha256(tensor.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
+
+
+# pair_data's draws (seed 0, randn, scale 1) at the shapes whose outputs this module pins: sha256_16
+# of x, W and G_p as the M3 registration drew them (CPU torch 2.15.0 on x86_64, whose seeded randn
+# takes the AVX2/AVX512 kernel). Seeded CPU randn gives other bytes on another kernel (the scalar
+# one, ATEN_CPU_CAPABILITY=default, or aarch64's, as in the GB300 image: M3's D-job D2), and outputs
+# pinned from one set of draws say nothing about another. So the per-column digests and the
+# registered S8 effect below are compared only where pair_data reproduces these draws; the other
+# checks of those tests run on every platform.
+_REGISTERED_DRAWS = {
+    (4096, 16384): ("156452d814073b60", "4071d7691a94ff0b", "d8c76c231d62ac7a"),
+    (520, 16384): ("ebf07aab2f50406b", "e73cfc1449dd477a", "5cc5ced63e493f9a"),
+    (112, 384): ("5a2e2828fc5896fa", "9b4c0cacd360a811", "339d45f86ce8824c"),
+}
+
+
+@functools.lru_cache(maxsize=None)
+def _draw_digests(T, K):
+    """sha256_16 of x, W and G_p of pair_data(T, K) (seed 0, randn, scale 1)."""
+    return tuple(_sha256_16(tensor) for tensor in _pair_data(T, K))
+
+
+def _compare_pinned(row, T, K, values):
+    """Whether pair_data(T, K) reproduces the registration's draws, so that the outputs pinned from
+    them are compared here. Prints the draws, this platform's values and the answer either way."""
+    draws = _draw_digests(T, K)
+    compared = draws == _REGISTERED_DRAWS[(T, K)]
+    print(
+        f"GLM_MHC_EMULATOR_PINNED row={row} draws={'/'.join(draws)} values={'/'.join(values)} "
+        f"compared={'yes' if compared else 'no'}"
+    )
+    return compared
+
+
+# shape -> (T, K, layouts, digest of g_W, digest of g_W under drop_kernel_split or None): production
+# (8 layouts of 3 or 4 unequal pieces), T = 520 (4 layouts of 3 pieces in every tile) and T = 112
+# (one layout of two unequal pieces, [0, 64) and [64, 112)). The digests (sha256_16 of the fp32
+# g_W) are the M3 registration's, from its own per-column wgrad code on pair_data seed 0: its
+# production baseline and its per-column checks at T = 520 and 112. drop_kernel_split runs off
+# production only. They are compared where pair_data reproduces the registration's draws
+# (_REGISTERED_DRAWS).
+_PER_COLUMN_SHAPES = {
+    "T4096_K16384": (4096, 16384, 8, "bc9294de06c6db33", None),
+    "T520_K16384": (520, 16384, 4, "9d1aa0ab55a0a68c", "11b06695286a9c21"),
+    "T112_K384": (112, 384, 1, "96318e856bcc16d0", "5cfe805ae3ad0f7e"),
+}
+
+
+@pytest.mark.parametrize("shape", list(_PER_COLUMN_SHAPES))
+def test_per_column_wgrad_equals_accumulate_per_piece(shape, request, production_wgrad):
+    """The per-column path (_accumulate_columns, which _contract runs for g_W) equals, for every
+    128-column tile, accumulate over each piece plus ordered_reduce of the tile's partials in piece
+    order, bitwise: each column group runs on its own pieces. Under drop_last_split it equals the
+    same with the last piece of every tile zeroed. Where pair_data reproduces the registration's
+    draws, both equal the registered digests."""
+    T, K, layouts, digest, dropped_digest = _PER_COLUMN_SHAPES[shape]
+    if T >= 4096:
+        request.getfixturevalue("heavy_cpu_case")
+    plans = glm_pair_fused_plans(T, K).wgrad
+    assert len(plans.groups) == layouts
+    assert len({stop - start for _, plan in plans.groups for start, stop in plan.splits}) > 1
+    a64, bt64 = _wgrad_operands(T, K)
+    if T >= 4096:
+        per_column = production_wgrad("fused")
+    else:
+        per_column = _accumulate_columns(a64, bt64, ALIGN_K8_X2, plans)
+    assert torch.equal(per_column, _per_piece_wgrad(a64, bt64, plans))
+    registered, measured = [digest], [_sha256_16(per_column)]
+    if dropped_digest is not None:
+        dropped = _accumulate_columns(a64, bt64, ALIGN_K8_X2, plans, drop_last_split=True)
+        assert torch.equal(dropped, _per_piece_wgrad(a64, bt64, plans, drop_last=True))
+        assert not torch.equal(dropped, per_column)
+        registered.append(dropped_digest)
+        measured.append(_sha256_16(dropped))
+    if _compare_pinned(f"per_column/{shape}", T, K, measured):
+        assert measured == registered
+
+
+def test_kernel_model_runs_the_shipped_plans():
+    """glm_pair_kernel_model on glm_pair_fused_plans at (112, 384): g_W is the per-column path's,
+    drop_kernel_split zeroes the last piece of every column tile and ignore_kernel_split runs one
+    chain over T for every column (both bitwise against accumulate per piece), and p is the ordered
+    reduction of GP-2's non-empty chains."""
+    T, K = 112, 384
+    x, W, G_p = _pair_data(T, K)
+    plans = glm_pair_fused_plans(T, K)
+    a64, bt64 = _wgrad_operands(T, K)
+    result = glm_pair_kernel_model(x, W, G_p, plans=plans)
+    assert torch.equal(result.xn, x.float() * gp1_s_model(x)[:, None])
+    assert torch.equal(result.g_W, _per_piece_wgrad(a64, bt64, plans.wgrad))
+    dropped = glm_pair_kernel_model(x, W, G_p, plans=plans, mutation="drop_kernel_split")
+    assert torch.equal(dropped.g_W, _per_piece_wgrad(a64, bt64, plans.wgrad, drop_last=True))
+    assert not torch.equal(dropped.g_W, result.g_W)
+    ignored = glm_pair_kernel_model(x, W, G_p, plans=plans, mutation="ignore_kernel_split")
+    assert torch.equal(ignored.g_W, accumulate(a64, bt64, ALIGN_K8_X2, single_chain(T)))
+    assert not torch.equal(ignored.g_W, result.g_W)
+    xn64, w64 = round_operand(result.xn, "rne"), round_operand(W, "rne")
+    chains = [
+        accumulate(xn64[:, start:stop], w64[:, start:stop], ALIGN_K8_X2, single_chain(stop - start))
+        for start, stop in gp2_plan_nonempty(K).splits
+    ]
+    assert torch.equal(result.p, ordered_reduce(torch.stack(chains)))
 
 
 @pytest.mark.parametrize("slot", OPERAND_SLOTS)
@@ -1038,6 +1366,26 @@ def test_emulator_split_power_on_g_w_at_production_t():
     assert effect >= P9_POWER_THRESHOLDS["g_W"]
 
 
+# The M3 registration's power table of the shipped plans (computed on CPU before any kernel output,
+# with its own per-column wgrad code and plan formulas): its row ignore_kernel_split/g_W at
+# T = 4096, K = 16384, pair_data seed 0, scale 1, covered (62.4 x the bar). It is compared where
+# pair_data reproduces the registration's draws (_REGISTERED_DRAWS).
+_REGISTERED_IGNORE_G_W_T4096 = 6.971007311506578e-06
+
+
+@pytest.mark.usefixtures("heavy_cpu_case")
+def test_fused_split_power_on_g_w_at_production_t(production_wgrad):
+    """On the shipped per-column plan at T = 4096, one chain over T per column instead of its pieces
+    moves g_W by 6.2 x the threshold: covered, as registered. Where pair_data reproduces the
+    registration's draws, the effect is also the registered one to a relative 1e-9 (two float64
+    computations of one formula)."""
+    effect = rel_rms(production_wgrad("one_chain"), production_wgrad("fused"))
+    _power_record("ignore_kernel_split/g_W/T4096/fused", effect, P9_POWER_THRESHOLDS["g_W"])
+    if _compare_pinned("ignore_kernel_split/g_W/T4096/fused", 4096, 16384, [repr(effect)]):
+        assert abs(effect - _REGISTERED_IGNORE_G_W_T4096) <= 1e-9 * _REGISTERED_IGNORE_G_W_T4096
+    assert effect >= P9_POWER_THRESHOLDS["g_W"]
+
+
 @pytest.fixture(scope="module")
 def power_cases():
     """Kernel-model emulations at T = 512, K = 16384, shared by this module's power tests.
@@ -1168,3 +1516,50 @@ def test_order_and_rn_power_minima(power_cases):
     assert rel_rms(power_cases(1.0, "project_first")["p"], base["p"]) >= 5e-5
     for tensor in ("p", "g_xn", "g_W"):
         assert rel_rms(power_cases(1.0, "rz_for_rn")[tensor], base[tensor]) >= 1e-4, tensor
+
+
+@pytest.fixture(scope="module")
+def fused_power_cases():
+    """g_W of kernel-model emulations at T = 512, K = 16384 on the shipped plans: "rne" operands,
+    ALIGN_K8_X2 and glm_pair_fused_plans (7 wgrad layouts of 3 pieces of 64-256 tokens), on
+    _pair_data (seed 0, scale 1)."""
+    cache = {}
+
+    def emulation(mutation=None):
+        if mutation not in cache:
+            x, W, G_p = _pair_data(_POWER_T, _POWER_K)
+            plans = glm_pair_fused_plans(_POWER_T, _POWER_K)
+            cache[mutation] = glm_pair_kernel_model(x, W, G_p, plans=plans, mutation=mutation).g_W
+        return cache[mutation]
+
+    yield emulation
+    cache.clear()
+
+
+# row -> mutation: the shipped plans' g_W rows at T = 512, split by their power against the g_W
+# threshold (computed on CPU, MODELED, before any kernel output). Dropping the last piece of every
+# column tile moves g_W by 4.9e5 x the threshold; one chain over T per column only by 0.78 x (P2's
+# split-M 2 row: 0.67 x), so ignore_kernel_split keeps its g_W check at T = 4096 alone.
+_FUSED_POWER_ROWS = {"drop_kernel_split/g_W/T512": "drop_kernel_split"}
+_FUSED_NOT_COVERED_ROWS = {"ignore_kernel_split/g_W/T512": "ignore_kernel_split"}
+
+
+@pytest.mark.usefixtures("heavy_cpu_case")
+@pytest.mark.parametrize("row", list(_FUSED_POWER_ROWS))
+def test_fused_plan_mutation_power(fused_power_cases, row):
+    """Each shipped-plan g_W row with power at T = 512 moves g_W by at least the g_W threshold."""
+    effect = rel_rms(fused_power_cases(_FUSED_POWER_ROWS[row]), fused_power_cases())
+    _power_record(f"{row}/fused", effect, P9_POWER_THRESHOLDS["g_W"])
+    assert effect >= P9_POWER_THRESHOLDS["g_W"], f"{row}: {effect:.3e}"
+
+
+@pytest.mark.usefixtures("heavy_cpu_case")
+def test_fused_plan_mutations_without_power_are_recorded(fused_power_cases):
+    """The shipped-plan g_W rows below the threshold at T = 512 change g_W, by less than the
+    threshold (test_fused_split_power_on_g_w_at_production_t covers ignore_kernel_split there)."""
+    for row, mutation in _FUSED_NOT_COVERED_ROWS.items():
+        mutated = fused_power_cases(mutation)
+        effect = rel_rms(mutated, fused_power_cases())
+        _power_record(f"{row}/fused", effect, P9_POWER_THRESHOLDS["g_W"])
+        assert not torch.equal(mutated, fused_power_cases()), row
+        assert effect < P9_POWER_THRESHOLDS["g_W"], f"{row} is covered now: {effect:.3e}"

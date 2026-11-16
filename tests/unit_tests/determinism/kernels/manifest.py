@@ -379,8 +379,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/fusions/fused_mhc_glm_projection.py",),
         tests=(K + "test_fused_triton_kernels.py",),
         kind="triton",
-        notes="Fixed-launch Triton Sinkhorn (num_warps=1) over fused_mhc_kernels' JIT kernels; "
-        "forward and backward replay, eager and under CUDA-graph capture.",
+        notes="Fixed-launch Triton Sinkhorn (num_warps=1) over fused_mhc_kernels' JIT kernels, "
+        "and the GLM projection pair (GP-1..GP-4 with GP-4p and GP-4r: fixed-config Triton "
+        "kernels, index-order chain reductions from zero, no atomics); forward and backward "
+        "replay, eager and under CUDA-graph capture.",
     ),
     KernelEntry(
         name="streamwise_residual_ops",

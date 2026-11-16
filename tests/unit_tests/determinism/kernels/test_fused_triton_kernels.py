@@ -20,7 +20,10 @@
   operations each selection binds (unfused, all operations, or ``mhc_fused_ops``). The
   fixed-launch Triton Sinkhorn that per-op ``sinkhorn`` binds (``fused_mhc_glm_projection``)
   replays forward and backward in the production layout and contiguous, and a CUDA graph of
-  its forward and backward replays bit for bit like an eager call.
+  its forward and backward replays bit for bit like an eager call. So does the GLM projection
+  pair of the same module (per-op ``proj_rms``: GP-1..GP-4 with GP-4p and GP-4r, fixed-config
+  Triton kernels with index-order chain reductions), at the production shape with the
+  gradients of both outputs, of ``p`` only and of ``s`` only, on the device it was validated on.
 """
 
 import contextlib
@@ -51,6 +54,8 @@ from tests.unit_tests.determinism.kernels.harness import (
     seeded,
 )
 from tests.unit_tests.determinism.utils import RacingStreams
+from tests.unit_tests.transformer.glm_mhc_emulator import pair_data
+from tests.unit_tests.transformer.mhc_fused_op_spy import spy_fused_mhc_ops
 
 try:
     import triton  # noqa: F401
@@ -637,6 +642,133 @@ def test_mhc_fixed_launch_sinkhorn_graph_replay_matches_eager():
         assert torch.isfinite(observed).all(), name
 
 
+# The GLM projection pair that per-op ``proj_rms`` binds (``fused_mhc_glm_projection``), at the
+# production shape: T = 4096 tokens, K = n x hidden = 16384. Its kernels are validated on sm_103
+# only; the op raises on any other device.
+_GLM_PAIR_T, _GLM_PAIR_K, _GLM_PAIR_EPS = 4096, 16384, 1e-5
+
+
+def _skip_unless_glm_pair_device():
+    """Skip unless the current device's capability is one the GLM projection pair accepts."""
+    capability = torch.cuda.get_device_capability()
+    if capability not in fused_mhc_glm_projection.GLM_PAIR_DEVICE_CAPABILITIES:
+        pytest.skip(
+            f"the GLM projection pair is validated on "
+            f"{fused_mhc_glm_projection.GLM_PAIR_DEVICE_CAPABILITIES} only, not {capability}"
+        )
+
+
+def _glm_pair_inputs(seed):
+    """bf16 x and fp32 W (leaves) and explicit fp32 gradients of p and s, from seeded CPU draws:
+    x, W and the gradient of p from pair_data at ``seed``, the gradient of s from seed 7 for
+    every input set (the registered seeds)."""
+    x, weight, grad_p = pair_data(_GLM_PAIR_T, _GLM_PAIR_K, seed=seed)
+    grad_s = torch.randn(_GLM_PAIR_T, generator=torch.Generator().manual_seed(7)).view(-1, 1)
+    return (x.cuda().requires_grad_(), weight.cuda().requires_grad_(), grad_p.cuda(), grad_s.cuda())
+
+
+@pytest.mark.parametrize("outputs", ["p_and_s", "p_only", "s_only"])
+def test_mhc_glm_proj_rms_replays_fwd_bwd(outputs):
+    """The GLM projection pair's outputs and input gradients replay bit-exactly.
+
+    ``p_only`` is the production path (no gradient of s), ``s_only`` the norm-only path (no
+    weight gradient, no wgrad kernels) and ``p_and_s`` both outputs with an explicit gradient of
+    s. The upstream gradients are explicit: the harness's all-ones default is not a production
+    gradient.
+    """
+    _skip_unless_glm_pair_device()
+    x, weight, grad_p, grad_s = _glm_pair_inputs(0)
+    op = fused_mhc_glm_projection.glm_proj_rms_op("rn")
+
+    def both(x, weight):
+        return op(x, weight, _GLM_PAIR_EPS)
+
+    def p_only(x, weight):
+        return op(x, weight, _GLM_PAIR_EPS)[0]
+
+    def s_only(x, weight):
+        return op(x, weight, _GLM_PAIR_EPS)[1]
+
+    fn, grad_outputs = {
+        "p_and_s": (both, {"out[0]": grad_p, "out[1]": grad_s}),
+        "p_only": (p_only, {"out": grad_p}),
+        "s_only": (s_only, {"out": grad_s}),
+    }[outputs]
+    replayed, grads = assert_replays_bit_exact(
+        fn,
+        (x, weight),
+        replays=3,
+        grad_outputs=grad_outputs,
+        contention=True,
+        what=f"mhc GLM projection pair[{outputs}]",
+    )
+    for name, tensor in {**replayed, **grads}.items():
+        assert torch.isfinite(tensor).all(), name
+    assert "in[0]" in grads
+    # Without a gradient of p the pair returns no weight gradient, as the unfused module does.
+    assert ("in[1]" in grads) == (outputs != "s_only")
+
+
+def test_mhc_glm_proj_rms_graph_replay_matches_eager():
+    """A CUDA graph of the GLM projection pair's forward and backward replays like eager.
+
+    The captured region starts with an ordinary torch kernel that produces x, so the forward's
+    programmatic dependent launches are captured behind a predecessor that is not one. Replays 2
+    and 3 run under side-stream contention. New values copied into the graph's static inputs
+    then replay to what an eager call gives on them.
+    """
+    _skip_unless_glm_pair_device()
+    x, weight, grad_p, grad_s = _glm_pair_inputs(0)
+    op = fused_mhc_glm_projection.glm_proj_rms_op("rn")
+
+    def step():
+        x_in = x * 1.0  # an ordinary torch kernel before GP-1
+        p, s = op(x_in, weight, _GLM_PAIR_EPS)
+        grad_x, grad_w = torch.autograd.grad((p, s), (x, weight), (grad_p, grad_s))
+        return p, s, grad_x, grad_w
+
+    def eager():
+        outputs = step()
+        torch.cuda.synchronize()
+        return tuple(t.detach().clone() for t in outputs)
+
+    expected = eager()
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_outputs = step()
+
+    def replay(contention):
+        context = RacingStreams() if contention else contextlib.nullcontext()
+        with context:
+            graph.replay()
+            torch.cuda.synchronize()
+        return tuple(t.detach().clone() for t in static_outputs)
+
+    names = ("p", "s", "x gradient", "weight gradient")
+    for index in range(3):
+        actual = replay(contention=index > 0)
+        for name, observed, reference in zip(names, actual, expected):
+            assert bytes_equal(observed, reference), f"replay {index + 1}: {name} != eager"
+
+    # A second input set, copied into the static inputs.
+    new_inputs = _glm_pair_inputs(1)
+    with torch.no_grad():
+        for static, new in zip((x, weight, grad_p, grad_s), new_inputs):
+            static.copy_(new)
+    actual = replay(contention=False)
+    expected_new = eager()
+    for name, observed, reference, first in zip(names, actual, expected_new, expected):
+        assert bytes_equal(observed, reference), f"new values: {name} != eager"
+        assert not bytes_equal(observed, first), f"new values: {name} did not change"
+        assert torch.isfinite(observed).all(), name
+
+
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
 def test_mhc_h_aggregate_replays_fwd_bwd(backend):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
@@ -876,7 +1008,7 @@ _MHC_MODULE_PROFILES = {
 
 
 @pytest.mark.parametrize("profile", list(_MHC_MODULE_PROFILES))
-def test_mhc_module_bound_ops_replay_fwd_bwd(profile):
+def test_mhc_module_bound_ops_replay_fwd_bwd(monkeypatch, profile):
     """One mHC module step replays bit-exactly through whatever the module bound.
 
     The selection (``use_fused_mhc`` alone, ``mhc_fused_ops`` or the unfused GLM flags) decides
@@ -895,6 +1027,7 @@ def test_mhc_module_bound_ops_replay_fwd_bwd(profile):
     if profile == "per_op_glm":
         # Otherwise a native fallback would pass this replay silently.
         assert hyper_connection._sinkhorn_op is fused_mhc_glm_projection.fixed_launch_sinkhorn
+        assert hyper_connection._glm_proj_rms_op is fused_mhc_glm_projection.glm_proj_rms_op("rn")
 
     class Step(torch.nn.Module):
         def __init__(self):
@@ -909,6 +1042,41 @@ def test_mhc_module_bound_ops_replay_fwd_bwd(profile):
             )
 
     x = _mhc_rand(128, 2, 4 * 128)
-    assert_module_replays_bit_exact(
-        Step(), (x,), replays=3, contention=True, what=f"mHC module[{profile}]"
+    replays = 3
+    # per_op_glm runs under the spy, which counts the GLM projection pair's calls and refusals: at
+    # this size (T 256 x K 512) the pair runs on the device it is validated on, and elsewhere the
+    # auto policy falls back to the unfused projection, once per forward.
+    spying = (
+        spy_fused_mhc_ops(hyper_connection) if profile == "per_op_glm" else contextlib.nullcontext()
     )
+    # The pair's backward reaches GP-4 through its module-level host launcher, once per backward.
+    backward_launches = []
+    if profile == "per_op_glm":
+        launch_backward = fused_mhc_glm_projection._glm_proj_bwd
+
+        def counting_backward(*args, **kwargs):
+            backward_launches.append(kwargs.get("mode"))
+            return launch_backward(*args, **kwargs)
+
+        monkeypatch.setattr(fused_mhc_glm_projection, "_glm_proj_bwd", counting_backward)
+    with spying as spy:
+        assert_module_replays_bit_exact(
+            Step(), (x,), replays=replays, contention=True, what=f"mHC module[{profile}]"
+        )
+    if profile == "per_op_glm":
+        capability = torch.cuda.get_device_capability()
+        if capability in fused_mhc_glm_projection.GLM_PAIR_DEVICE_CAPABILITIES:
+            # One forward and one backward per replay, each through the bound pair.
+            spy.assert_ran(
+                "_glm_proj_rms_op",
+                fused_mhc_glm_projection.glm_proj_rms_op("rn"),
+                min_calls=replays,
+            )
+            assert spy.calls("_glm_proj_rms_op") == replays
+            spy.assert_no_unsupported()
+            assert len(backward_launches) == replays, backward_launches
+        else:
+            # One forward per replay, each refused by the pair on this device: it never ran.
+            assert spy.unsupported("_glm_proj_rms_op") == replays, capability
+            assert spy.calls("_glm_proj_rms_op") == 0, capability
+            assert backward_launches == [], capability
