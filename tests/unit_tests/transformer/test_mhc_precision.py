@@ -16,12 +16,21 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.fusions import fused_mhc_glm_projection as glm
+from megatron.core.fusions import fused_mhc_kernels as fmk
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     native_h_aggregate,
     native_h_aggregate_into,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.transformer.mhc_fused_op_spy import spy_fused_mhc_ops
+
+# The fixed-launch Triton Sinkhorn needs both. The CPU test environment can have Triton without
+# CUDA, where a Triton-only mark would let these cases error instead of skipping.
+_NEEDS_CUDA_TRITON = pytest.mark.skipif(
+    not (torch.cuda.is_available() and fmk.is_triton_available()), reason="needs CUDA and Triton"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -134,9 +143,23 @@ def test_mhc_precision(fp32_mixing, input_scale):
 
 @pytest.mark.parametrize("input_scale", [1.0, 1e-3])
 @pytest.mark.parametrize("fp32_mappings", [False, True])
-def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
-    """Keep the production 4096-wide hidden state and four residual streams."""
+@pytest.mark.parametrize(
+    "fused_ops",
+    [None, pytest.param(["sinkhorn"], marks=_NEEDS_CUDA_TRITON)],
+    ids=["unfused", "sinkhorn"],
+)
+def test_glm_mhc_official_forward_and_all_gradients(
+    monkeypatch, input_scale, fp32_mappings, fused_ops
+):
+    """Keep the production 4096-wide hidden state and four residual streams.
+
+    With ``fused_ops``, per-op mode binds those operations under the explicit ``triton`` policy,
+    so construction fails rather than testing the unfused path when Triton is missing.
+    """
     torch.manual_seed(42)
+    fused = {}
+    if fused_ops is not None:
+        fused = dict(use_fused_mhc=True, mhc_fused_ops=fused_ops, mhc_fused_backend="triton")
     config = TransformerConfig(
         num_layers=1,
         hidden_size=4096,
@@ -149,6 +172,7 @@ def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
         mhc_keep_mappings_in_fp32=fp32_mappings,
         mhc_keep_pre_in_fp32=True,
         mhc_learned_output_contract=False,
+        **fused,
     )
     module = HyperConnectionModule(config, layer_number=1).cuda()
     with torch.no_grad():
@@ -172,15 +196,25 @@ def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
     actual_branch = branch.clone().requires_grad_()
     reference_branch = branch.clone().requires_grad_()
 
-    pre, post, mixing = module.compute_mappings(actual_input)
-    mapping_dtype = torch.float32 if fp32_mappings else hidden.dtype
-    assert pre.dtype == torch.float32
-    assert post.dtype == mixing.dtype == mapping_dtype
-    aggregated = module.aggregate(actual_input, pre)
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        actual = module.fused_h_res_h_post_bda(
-            mixing, actual_input, post, (actual_branch, None), 0.0, True, False
-        )
+    # The spy counts forward calls only, so the Triton Sinkhorn's backward is counted here.
+    sinkhorn_backward_calls = []
+    sinkhorn_bwd = glm._sinkhorn_bwd
+
+    def counted_sinkhorn_bwd(*args, **kwargs):
+        sinkhorn_backward_calls.append(None)
+        return sinkhorn_bwd(*args, **kwargs)
+
+    monkeypatch.setattr(glm, "_sinkhorn_bwd", counted_sinkhorn_bwd)
+    with spy_fused_mhc_ops(module) as spy:
+        pre, post, mixing = module.compute_mappings(actual_input)
+        mapping_dtype = torch.float32 if fp32_mappings else hidden.dtype
+        assert pre.dtype == torch.float32
+        assert post.dtype == mixing.dtype == mapping_dtype
+        aggregated = module.aggregate(actual_input, pre)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            actual = module.fused_h_res_h_post_bda(
+                mixing, actual_input, post, (actual_branch, None), 0.0, True, False
+            )
     expected_aggregate, expected_post, expected_mixing = _official_mhc(
         reference_input, reference_parameters, 4, config.mhc_sinkhorn_iterations, 1e-5
     )
@@ -216,6 +250,11 @@ def test_glm_mhc_official_forward_and_all_gradients(input_scale, fp32_mappings):
     _assert_similarity(actual_branch.grad, reference_branch.grad, "branch gradient")
     for name, parameter in module.named_parameters():
         _assert_similarity(parameter.grad, reference_parameters[name].grad, name)
+    if fused_ops is not None:
+        # The Triton Sinkhorn ran both ways: one forward call and one backward launch.
+        spy.assert_ran("_sinkhorn_op", glm.fixed_launch_sinkhorn)
+        assert spy.calls("_sinkhorn_op") == 1
+        assert len(sinkhorn_backward_calls) == 1
 
 
 @pytest.mark.parametrize("fp32_mappings", [False, True])

@@ -716,6 +716,13 @@ class HyperConnectionModule(MegatronModule):
         keep them too, so in per-op mode the native policy means the unfused path. The
         all-operations mode binds the fused kernels' projection-first native op instead; the
         difference is intended.
+
+        ``sinkhorn`` binds the fixed-launch Triton Sinkhorn of fused_mhc_glm_projection when
+        Triton is available; under ``auto`` without Triton it keeps the unfused object, with a
+        warning. Triton counts as unavailable also under ``MHC_DISABLE_TRITON=1`` and
+        ``MHC_FORCE_BACKEND=cutile``. proj_rms with ``mhc_norm_eps_inside_sqrt`` and
+        ``mhc_normalize_before_projection`` has no per-op implementation in this build: it keeps
+        the unfused object under ``auto`` and fails under ``triton``.
         """
         # Configs edited after TransformerConfig validation. The table needs a well-formed
         # list, so it runs only when the field checks pass.
@@ -739,14 +746,28 @@ class HyperConnectionModule(MegatronModule):
         if policy == "native":
             return {op: "native(mhc_fused_backend=native)" for op in config.mhc_fused_ops}
 
-        labels, missing = {}, []
+        labels, missing, unavailable = {}, [], []
         fmk_labels = _fmk_op_labels(policy, MHC_FUSED_OPS)
         for op in MHC_FUSED_OPS:
             if op not in config.mhc_fused_ops:
                 continue
+            if op == "sinkhorn":
+                # Triton-only. The policy is auto or triton here: native returned above, the
+                # table rejects cutile, and triton without Triton raised in _validate_mhc_backend.
+                if fmk.is_triton_available():
+                    # Lazy: the file imports fused_mhc_kernels, which imports this module.
+                    from megatron.core.fusions import fused_mhc_glm_projection as glm
+
+                    self._sinkhorn_op = glm.fixed_launch_sinkhorn
+                    labels[op] = f"triton(num_warps={glm.SINKHORN_NUM_WARPS})"
+                else:
+                    labels[op] = "native(triton unavailable)"
+                    unavailable.append(op)
+                continue
             if op in triton_only_ops(config):
-                # The fixed-launch Triton Sinkhorn and the Triton GLM projection pair are not
-                # implemented yet, so a listed Triton-only operation keeps its unfused object.
+                # The Triton GLM projection pair is not implemented yet, so proj_rms with
+                # mhc_norm_eps_inside_sqrt and mhc_normalize_before_projection keeps its unfused
+                # object.
                 labels[op] = "native(no per-op implementation)"
                 missing.append(op)
                 continue
@@ -766,6 +787,8 @@ class HyperConnectionModule(MegatronModule):
             )
         if missing:
             _warn_per_op_fallback_once(missing, "no per-op implementation in this build")
+        if unavailable:
+            _warn_per_op_fallback_once(unavailable, "Triton is unavailable")
         return labels
 
     def _init_weights(self) -> None:

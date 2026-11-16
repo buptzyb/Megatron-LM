@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from megatron.core import _rank_utils
+from megatron.core.fusions import fused_mhc_glm_projection as glm
 from megatron.core.fusions import fused_mhc_kernels as fmk
 from megatron.core.transformer import hyper_connection as hc
 from megatron.core.transformer.mhc_fused_ops import MHC_FUSED_OPS, MHC_PRECISION_FLAGS
@@ -50,6 +51,7 @@ MODULE_LEGACY_MESSAGE = (
     "activation-dtype rounding preservation."
 )
 NO_PER_OP_IMPLEMENTATION = "native(no per-op implementation)"
+TRITON_SINKHORN = "triton(num_warps=1)"
 # Every bound operation that the unfused binding holds as a module-level object (or None).
 MODULE_LEVEL_OPS = (
     "_sinkhorn_op",
@@ -84,10 +86,14 @@ def _assert_partial(op, func, **keywords):
     assert (op.func, op.args, op.keywords) == (func, (), keywords)
 
 
-def _assert_same_binding(module, reference):
-    """Assert that ``module`` binds the objects the unfused ``reference`` binds."""
+def _assert_same_binding(module, reference, exclude=()):
+    """Assert that ``module`` binds the objects the unfused ``reference`` binds.
+
+    The attributes in ``exclude`` are not compared; the caller checks them.
+    """
     for name in MODULE_LEVEL_OPS:
-        assert getattr(module, name) is getattr(reference, name), name
+        if name not in exclude:
+            assert getattr(module, name) is getattr(reference, name), name
     _assert_partial(module._proj_rms_op, hc._proj_rms_impl, **reference._proj_rms_op.keywords)
 
 
@@ -563,11 +569,11 @@ def test_unset_binds_todays_objects(overrides):
 
 
 # The attributes each operation rebinds in per-op mode without precision flags, and the
-# fused kernels' function each binds. sinkhorn is Triton-only and has no per-op implementation
-# yet, so it rebinds nothing.
+# function each binds: a partial of the fused kernels' function with the policy, or for
+# sinkhorn the fixed-launch Triton Sinkhorn of fused_mhc_glm_projection itself.
 _PER_OP_REBINDS = {
     "proj_rms": {"_proj_rms_compute_h_op": "fused_proj_rms_compute_h"},
-    "sinkhorn": {},
+    "sinkhorn": {"_sinkhorn_op": "fixed_launch_sinkhorn"},
     "h_aggregate": {
         "_h_aggregate_op": "fused_h_aggregate",
         "_h_aggregate_into_op": "fused_h_aggregate_into",
@@ -583,13 +589,14 @@ _PER_OP_REBINDS = {
         (op, policy)
         for policy in ("triton", "cutile")
         for op in ("proj_rms", "h_aggregate", "h_post_bda")
-    ],
+    ]
+    + [("sinkhorn", "triton")],
 )
 def test_per_op_binds_only_listed_ops(monkeypatch, triton_only_fmk, warnings_logged, op, policy):
-    """A listed operation binds the fused kernels under the configured policy, and only it.
+    """A listed operation binds its per-op implementation under the configured policy, and only it.
 
-    sinkhorn has no per-op implementation yet: an explicit triton policy fails for it, and
-    cutile is rejected by the config.
+    sinkhorn binds the fixed-launch Triton Sinkhorn under auto and triton; cutile is rejected by
+    the config.
     """
     if policy == "cutile":
         monkeypatch.setattr(fmk, "is_triton_available", lambda: False)
@@ -598,10 +605,13 @@ def test_per_op_binds_only_listed_ops(monkeypatch, triton_only_fmk, warnings_log
     reference = _module(_config())
     rebinds = _PER_OP_REBINDS[op]
     for name in MODULE_LEVEL_OPS:
-        if name in rebinds:
-            _assert_partial(getattr(module, name), getattr(fmk, rebinds[name]), backend=policy)
-        else:
+        if name not in rebinds:
             assert getattr(module, name) is getattr(reference, name), name
+        elif op == "sinkhorn":
+            # A module-level object, not a partial: the spy's identity check applies.
+            assert getattr(module, name) is getattr(glm, rebinds[name]), name
+        else:
+            _assert_partial(getattr(module, name), getattr(fmk, rebinds[name]), backend=policy)
     _assert_partial(
         module._proj_rms_op,
         hc._proj_rms_impl,
@@ -610,25 +620,21 @@ def test_per_op_binds_only_listed_ops(monkeypatch, triton_only_fmk, warnings_log
     )
 
     labels = dict(module._fused_op_labels)
-    if rebinds:
-        assert labels.pop(op).startswith(f"fmk({policy}:")
-        assert warnings_logged == []
+    if op == "sinkhorn":
+        assert labels.pop(op) == TRITON_SINKHORN
     else:
-        assert labels.pop(op) == NO_PER_OP_IMPLEMENTATION
-        assert warnings_logged == [
-            (
-                logging.WARNING,
-                f"[mHC] Falling back to the unfused path for mhc_fused_ops ['{op}']: "
-                "no per-op implementation in this build.",
-            )
-        ]
+        assert labels.pop(op).startswith(f"fmk({policy}:")
+    assert warnings_logged == []
     assert labels == {
         name: label for name, label in reference._fused_op_labels.items() if name != op
     }
 
 
-def test_per_op_glm_binding_keeps_the_parity_contract(warnings_logged):
-    """[proj_rms, sinkhorn] with the GLM flags keeps the objects the parity tests require."""
+def test_per_op_glm_binding_keeps_the_parity_contract(triton_only_fmk, warnings_logged):
+    """[proj_rms, sinkhorn] with the GLM flags keeps the objects the parity tests require.
+
+    Only the Sinkhorn changes: it binds the fixed-launch Triton Sinkhorn.
+    """
     config = _per_op(["proj_rms", "sinkhorn"], **GLM_FLAGS)
     module = _module(config)
     # The projection runs inside _projection_and_get_norm, and the post is the emulate-casts
@@ -640,17 +646,18 @@ def test_per_op_glm_binding_keeps_the_parity_contract(warnings_logged):
         "eps_inside_sqrt": True,
         "normalize_before_projection": True,
     }
-    _assert_same_binding(module, _module(_config(**GLM_FLAGS)))
+    assert module._sinkhorn_op is glm.fixed_launch_sinkhorn
+    _assert_same_binding(module, _module(_config(**GLM_FLAGS)), exclude=("_sinkhorn_op",))
     assert module._fused_op_labels == {
         "proj_rms": NO_PER_OP_IMPLEMENTATION,
-        "sinkhorn": NO_PER_OP_IMPLEMENTATION,
+        "sinkhorn": TRITON_SINKHORN,
         "h_aggregate": "native",
         "h_post_bda": "native(emulate-casts)",
     }
     assert warnings_logged == [
         (
             logging.WARNING,
-            "[mHC] Falling back to the unfused path for mhc_fused_ops ['proj_rms', 'sinkhorn']: "
+            "[mHC] Falling back to the unfused path for mhc_fused_ops ['proj_rms']: "
             "no per-op implementation in this build.",
         )
     ]
@@ -659,23 +666,83 @@ def test_per_op_glm_binding_keeps_the_parity_contract(warnings_logged):
     assert len(warnings_logged) == 1
 
 
-@pytest.mark.parametrize(
-    "ops, flags",
-    [(["proj_rms", "sinkhorn"], GLM_FLAGS), (["sinkhorn"], {})],
-    ids=["glm", "sinkhorn"],
-)
+@pytest.mark.parametrize("ops, flags", [(["proj_rms", "sinkhorn"], GLM_FLAGS)], ids=["glm"])
 def test_per_op_explicit_triton_fails_without_per_op_implementation(triton_only_fmk, ops, flags):
     """An explicit triton policy never falls back to the unfused path: it fails at construction.
 
-    This build has no Triton per-op implementation for proj_rms with the GLM flags or for
-    sinkhorn; this test changes once they exist.
+    This build has no Triton per-op implementation for proj_rms with the GLM flags, so the error
+    names proj_rms only (sinkhorn binds); this test changes once that implementation exists.
     """
     with pytest.raises(RuntimeError) as error:
         _module(_per_op(ops, mhc_fused_backend="triton", **flags))
     assert str(error.value) == (
-        f"mHC fused backend 'triton' was requested for {ops}, but this build has no Triton "
-        "per-op implementation for them."
+        "mHC fused backend 'triton' was requested for ['proj_rms'], but this build has no "
+        "Triton per-op implementation for them."
     )
+
+
+@pytest.mark.parametrize(
+    "ops, flags, labels",
+    [
+        (
+            ["sinkhorn"],
+            {},
+            {"proj_rms": "native", "h_aggregate": "native", "h_post_bda": "native(compiled)"},
+        ),
+        (
+            ["proj_rms", "sinkhorn"],
+            GLM_FLAGS,
+            {
+                "proj_rms": NO_PER_OP_IMPLEMENTATION,
+                "h_aggregate": "native",
+                "h_post_bda": "native(emulate-casts)",
+            },
+        ),
+    ],
+    ids=["plain", "glm"],
+)
+def test_per_op_sinkhorn_without_triton_keeps_native(
+    monkeypatch, warnings_logged, ops, flags, labels
+):
+    """Under auto on a rank without Triton, sinkhorn keeps the unfused Sinkhorn, with a warning."""
+    monkeypatch.setattr(fmk, "is_triton_available", lambda: False)
+    monkeypatch.setattr(fmk, "is_cutile_available", lambda: False)
+    config = _per_op(ops, **flags)
+    module = _module(config)
+    assert module._sinkhorn_op is hc.native_sinkhorn
+    _assert_same_binding(module, _module(_config(**flags)))
+    assert module._fused_op_labels == dict(labels, sinkhorn="native(triton unavailable)")
+    expected = [
+        (
+            logging.WARNING,
+            "[mHC] Falling back to the unfused path for mhc_fused_ops ['sinkhorn']: "
+            "Triton is unavailable.",
+        )
+    ]
+    if "proj_rms" in ops:
+        expected.insert(
+            0,
+            (
+                logging.WARNING,
+                "[mHC] Falling back to the unfused path for mhc_fused_ops ['proj_rms']: "
+                "no per-op implementation in this build.",
+            ),
+        )
+    assert warnings_logged == expected
+    # Once per process.
+    _module(config)
+    assert warnings_logged == expected
+
+
+def test_per_op_sinkhorn_label_reads_the_num_warps_constant(monkeypatch, triton_only_fmk):
+    """The label reads SINKHORN_NUM_WARPS when the module binds, as the launch does when it runs.
+
+    test_fused_mhc_glm_projection.py checks the launch with the same patched constant (GPU).
+    """
+    monkeypatch.setattr(glm, "SINKHORN_NUM_WARPS", 2)
+    module = _module(_per_op(["sinkhorn"]))
+    assert module._sinkhorn_op is glm.fixed_launch_sinkhorn
+    assert module._fused_op_labels["sinkhorn"] == "triton(num_warps=2)"
 
 
 def test_per_op_does_not_log_fmk_backend_selection(monkeypatch):
@@ -778,6 +845,7 @@ def test_policy_native_binds_todays_objects(warnings_logged, ops, flags):
 
 _FORCED_NATIVE_SCRIPT = """
 import json
+import sys
 from functools import partial
 
 from megatron.core.fusions import fused_mhc_kernels as fmk
@@ -823,6 +891,15 @@ def is_unfused(m):
 per_op = module(use_fused_mhc=True, mhc_fused_ops=list(MHC_FUSED_OPS))
 per_op_glm = module(use_fused_mhc=True, mhc_fused_ops=["proj_rms", "sinkhorn"], **GLM)
 all_ops = module(use_fused_mhc=True)
+# The modules return before binding sinkhorn, so they never import the fixed-launch file.
+glm_imported_by_modules = "megatron.core.fusions.fused_mhc_glm_projection" in sys.modules
+from megatron.core.fusions import fused_mhc_glm_projection as glm
+
+try:
+    glm._sinkhorn_kernels()
+    glm_kernel_lookup = None
+except Exception as error:
+    glm_kernel_lookup = type(error).__name__
 all_ops_functions = {
     "_sinkhorn_op": fmk.fused_sinkhorn,
     "_h_aggregate_op": fmk.fused_h_aggregate,
@@ -848,6 +925,9 @@ print(
             "per_op_glm_unfused": is_unfused(per_op_glm),
             "per_op_labels": per_op._fused_op_labels,
             "all_ops_bound": all_ops_bound,
+            "glm_imported_by_modules": glm_imported_by_modules,
+            "glm_num_warps": glm.SINKHORN_NUM_WARPS,
+            "glm_kernel_lookup": glm_kernel_lookup,
         }
     )
 )
@@ -855,12 +935,18 @@ print(
 
 
 def test_forced_native_environment_in_fresh_process():
-    """The real MHC_FORCE_BACKEND=native, which the fused kernels read once, at import."""
+    """The real MHC_FORCE_BACKEND=native, which the fused kernels read once, at import.
+
+    fused_mhc_glm_projection imports there too, and its kernel lookup fails closed.
+    """
     result = _run_python(_FORCED_NATIVE_SCRIPT, dict(os.environ, MHC_FORCE_BACKEND="native"))
     assert result["forced_backend"] == "native"
     assert not result["triton_available"]
     assert not result["triton_kernels_defined"]
     assert result["per_op_unfused"] and result["per_op_glm_unfused"]
+    assert not result["glm_imported_by_modules"]
+    assert result["glm_num_warps"] == 1
+    assert result["glm_kernel_lookup"] == "RuntimeError"
     assert result["per_op_labels"] == {
         op: "native(MHC_FORCE_BACKEND=native)" for op in MHC_FUSED_OPS
     }
@@ -1052,15 +1138,14 @@ _PER_OP_FMK_OPS = ["proj_rms", "h_aggregate", "h_post_bda"]
             dict(use_fused_mhc=True, mhc_fused_ops=["proj_rms", "sinkhorn"], **GLM_FLAGS),
             None,
             "mode=per-op policy=auto MHC_FORCE_BACKEND=unset "
-            "proj_rms=native(no per-op implementation) sinkhorn=native(no per-op implementation) "
+            "proj_rms=native(no per-op implementation) sinkhorn=triton(num_warps=1) "
             "h_aggregate=native h_post_bda=native(emulate-casts)",
         ),
         (
             dict(use_fused_mhc=True, mhc_fused_ops=["sinkhorn"]),
             None,
             "mode=per-op policy=auto MHC_FORCE_BACKEND=unset proj_rms=native "
-            "sinkhorn=native(no per-op implementation) h_aggregate=native "
-            "h_post_bda=native(compiled)",
+            "sinkhorn=triton(num_warps=1) h_aggregate=native h_post_bda=native(compiled)",
         ),
         (
             dict(use_fused_mhc=True, mhc_fused_ops=_PER_OP_FMK_OPS),

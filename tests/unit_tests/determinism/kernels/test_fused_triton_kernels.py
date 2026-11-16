@@ -17,7 +17,10 @@
 * mHC hyper-connection kernels (``fused_mhc_kernels``): Sinkhorn, h-aggregate and h-post-BDA
   contain real ``tl.sum`` reductions under autotune, on the Triton, native (``torch.compile``)
   and, when available, cuTile backends; plus one ``HyperConnectionModule`` step through the
-  operations each selection binds (unfused, all operations, or ``mhc_fused_ops``).
+  operations each selection binds (unfused, all operations, or ``mhc_fused_ops``). The
+  fixed-launch Triton Sinkhorn that per-op ``sinkhorn`` binds (``fused_mhc_glm_projection``)
+  replays forward and backward in the production layout and contiguous, and a CUDA graph of
+  its forward and backward replays bit for bit like an eager call.
 """
 
 import contextlib
@@ -27,7 +30,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core import config as mcore_config
-from megatron.core.fusions import fused_mhc_kernels
+from megatron.core.fusions import fused_mhc_glm_projection, fused_mhc_kernels
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
@@ -47,6 +50,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     bytes_equal,
     seeded,
 )
+from tests.unit_tests.determinism.utils import RacingStreams
 
 try:
     import triton  # noqa: F401
@@ -533,6 +537,106 @@ def test_native_mhc_sinkhorn_checkpoint_replays_with_limited_compile_cache(compi
         torch._dynamo.reset()
 
 
+# The fixed-launch Triton Sinkhorn that per-op ``sinkhorn`` binds, at the production shape
+# (T = 4096 tokens, n = 4). HyperConnectionModule passes the logits as a view at offset 8 into
+# the [T, 1, 24] mapping projection, and the upstream gradient arrives transposed.
+_SINKHORN_SHAPE = (4096, 1, 4, 4)
+_SINKHORN_LOGITS_LAYOUT = ((24, 16, 4, 1), 8, 4096 * 24)  # strides, storage offset, storage size
+_SINKHORN_GRAD_LAYOUT = ((16, 4, 1, 4), 0, 4096 * 16)
+
+
+def _sinkhorn_production_inputs(logits_seed, grad_seed, contiguous=False):
+    """fp32 logits (a leaf) and a bf16-rounded upstream gradient from seeded CPU generators."""
+    logits = torch.randn(_SINKHORN_SHAPE, generator=torch.Generator().manual_seed(logits_seed))
+    grad = torch.randn(_SINKHORN_SHAPE, generator=torch.Generator().manual_seed(grad_seed))
+    grad = grad.bfloat16().float()  # production's gradient is the fp32 upcast of a bf16 one
+
+    def place(values, layout):
+        if contiguous:
+            return values.cuda()
+        stride, offset, numel = layout
+        view = torch.zeros(numel, device="cuda").as_strided(_SINKHORN_SHAPE, stride, offset)
+        return view.copy_(values.cuda()).detach()
+
+    logits = place(logits, _SINKHORN_LOGITS_LAYOUT).requires_grad_()
+    return logits, place(grad, _SINKHORN_GRAD_LAYOUT)
+
+
+@pytest.mark.parametrize("layout", ["production", "contiguous"])
+def test_mhc_fixed_launch_sinkhorn_replays_fwd_bwd(layout):
+    """The fixed-launch Sinkhorn's output and logits gradient replay bit-exactly.
+
+    The upstream gradient is explicit: the harness's all-ones default makes the Sinkhorn's
+    logits gradient nearly zero.
+    """
+    logits, grad = _sinkhorn_production_inputs(1234, 4321, contiguous=layout == "contiguous")
+    outputs, grads = assert_replays_bit_exact(
+        lambda x: fused_mhc_glm_projection.fixed_launch_sinkhorn(x, 20, 1e-6),
+        (logits,),
+        replays=3,
+        grad_outputs={"out": grad},
+        contention=True,
+        what=f"mhc fixed-launch sinkhorn[{layout}]",
+    )
+    assert torch.isfinite(outputs["out"]).all()
+    assert torch.isfinite(grads["in[0]"]).all()
+
+
+def test_mhc_fixed_launch_sinkhorn_graph_replay_matches_eager():
+    """A CUDA graph of the fixed-launch Sinkhorn's forward and backward replays like eager.
+
+    Replays 2 and 3 run under side-stream contention. New values copied into the graph's
+    static inputs then replay to what an eager call gives on them.
+    """
+    logits, grad = _sinkhorn_production_inputs(1234, 4321)
+
+    def step():
+        out = fused_mhc_glm_projection.fixed_launch_sinkhorn(logits, 20, 1e-6)
+        (logits_grad,) = torch.autograd.grad(out, logits, grad)
+        return out, logits_grad
+
+    def eager():
+        out, logits_grad = step()
+        torch.cuda.synchronize()
+        return out.detach().clone(), logits_grad.clone()
+
+    expected = eager()
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        for _ in range(3):
+            step()
+    torch.cuda.current_stream().wait_stream(side_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out, static_grad = step()
+
+    def replay(contention):
+        context = RacingStreams() if contention else contextlib.nullcontext()
+        with context:
+            graph.replay()
+            torch.cuda.synchronize()
+        return static_out.detach().clone(), static_grad.clone()
+
+    names = ("output", "logits gradient")
+    for index in range(3):
+        actual = replay(contention=index > 0)
+        for name, observed, reference in zip(names, actual, expected):
+            assert bytes_equal(observed, reference), f"replay {index + 1}: {name} != eager"
+
+    # A second input set, copied into the static inputs.
+    new_logits, new_grad = _sinkhorn_production_inputs(5678, 8765)
+    with torch.no_grad():
+        logits.copy_(new_logits)
+        grad.copy_(new_grad)
+    actual = replay(contention=False)
+    expected_new = eager()
+    for name, observed, reference, first in zip(names, actual, expected_new, expected):
+        assert bytes_equal(observed, reference), f"new values: {name} != eager"
+        assert not bytes_equal(observed, first), f"new values: {name} did not change"
+        assert torch.isfinite(observed).all(), name
+
+
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
 def test_mhc_h_aggregate_replays_fwd_bwd(backend):
     if backend == "triton" and not fused_mhc_kernels.is_triton_available():
@@ -788,6 +892,9 @@ def test_mhc_module_bound_ops_replay_fwd_bwd(profile):
         **_MHC_MODULE_PROFILES[profile],
     )
     hyper_connection = HyperConnectionModule(config, 1).cuda()
+    if profile == "per_op_glm":
+        # Otherwise a native fallback would pass this replay silently.
+        assert hyper_connection._sinkhorn_op is fused_mhc_glm_projection.fixed_launch_sinkhorn
 
     class Step(torch.nn.Module):
         def __init__(self):
