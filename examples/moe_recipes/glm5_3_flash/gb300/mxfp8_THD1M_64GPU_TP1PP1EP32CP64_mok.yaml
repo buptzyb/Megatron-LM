@@ -102,7 +102,6 @@ ARGS:
   linear_num_key_heads: 64
   linear_num_value_heads: 64
   kda_two_stage_gates: true
-  kda_disable_fp8: true
   kda_conv_in_fp32: true
   kda_safe_gate: true
   kda_lower_bound: "-5.0"
@@ -117,8 +116,6 @@ ARGS:
   dsa_indexer_kpool: 4
   dsa_indexer_kpool_key_dtype_compression: true
   dsa_indexer_hf_scoring: true
-  no_dsa_indexer_qk_proj_use_quantization: true
-  no_mla_proj_use_quantization: true
   no_dsa_indexer_rotate_activation: true
   dsa_indexer_k_norm_epsilon: "1e-06"
   no_dsa_indexer_weights_proj_use_quantization: true
