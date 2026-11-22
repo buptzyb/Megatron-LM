@@ -4180,13 +4180,17 @@ def run_sparse_indexer_loss_from_topk(
     calculate_per_token_loss: bool = False,
     config: Optional["TransformerConfig"] = None,
     deterministic: bool = False,
+    lse: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     """Run the cuDNN sparse indexer loss for top-k selected by an earlier call.
 
     ``topk_indices``/``topk_length``/``topk_scores`` must come from
     ``run_fused_qk_topk_with_scores`` on the same layer inputs. The scores enter the loss
     only through a per-row softmax over the valid slots, so the log-probability payload of
-    ``dsa_indexer_precision='mxfp8'`` is consumed exactly like logits.
+    ``dsa_indexer_precision='mxfp8'`` is consumed exactly like logits. ``lse``, when given,
+    is the FP32 ``[sq, b, np]`` LSE that ``run_fused_absorbed_sparse_attention`` returned
+    (``return_lse=True``) for exactly these ``topk_indices`` and ``topk_length``; the loss then
+    reuses it instead of running the sparse attention forward a second time.
     """
     tp_group = getattr(pg_collection, "tp", None)
     if loss_coeff <= 0:
@@ -4206,6 +4210,11 @@ def run_sparse_indexer_loss_from_topk(
         return None
     if tuple(topk_length.shape) != (batch, rows):
         return None
+    lse_flat = None
+    if lse is not None:
+        if tuple(lse.shape) != tuple(query.shape[:3]) or lse.dtype != torch.float32:
+            return None
+        lse_flat = lse.reshape(rows * batch, query.size(2))
 
     latent_v_channels = int(config.kv_lora_rank)
     return SparseIndexerLossFromTopKFunc.apply(
@@ -4228,6 +4237,7 @@ def run_sparse_indexer_loss_from_topk(
             or getattr(config, "deterministic_mode", False)
             or torch.are_deterministic_algorithms_enabled()
         ),
+        lse_flat,
     )
 
 
@@ -4898,16 +4908,20 @@ def _sparse_indexer_loss_and_grads_for_selected_topk(
     calculate_per_token_loss: bool,
     tp_group,
     deterministic: bool,
+    lse: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Sparse indexer loss and precomputed gradients for an already selected top-k set.
 
-    FlashMLA returns only the output and LSE, so the attention target needs one
-    sparse-attention forward over the attention-ordered indices for its LSE. The loss
-    then reads the indexer scores aligned with ``topk_indices_cmp``.
+    The attention target needs the LSE of the sparse attention over the attention-ordered
+    indices. A caller that ran that attention passes its ``lse`` (``(sq * b, heads)``, rows
+    ``s * b + b_idx``); otherwise one sparse-attention forward computes it here, because
+    FlashMLA returns only the output and LSE. The loss then reads the indexer scores aligned
+    with ``topk_indices_cmp``.
     """
-    _out_flat, lse, *_ = _run_sparse_attention_forward(
-        query, kv_full, topk_indices_attn, softmax_scale, d_v, topk_length=topk_length_attn
-    )
+    if lse is None:
+        _out_flat, lse, *_ = _run_sparse_attention_forward(
+            query, kv_full, topk_indices_attn, softmax_scale, d_v, topk_length=topk_length_attn
+        )
     return _compute_sparse_indexer_loss_and_grads(
         q_idx_bshd=q_idx_bshd,
         k_idx_bsd=k_idx_bsd,
@@ -5647,8 +5661,13 @@ class SparseIndexerLossFromTopKFunc(torch.autograd.Function):
         query_valid_rows: Optional[Tensor],
         tp_group,
         deterministic: bool = False,
+        lse: Optional[Tensor] = None,
     ) -> Tensor:
-        """Compute the sparse indexer loss from stored top-k indices and scores."""
+        """Compute the sparse indexer loss from stored top-k indices and scores.
+
+        ``lse``, when given, is the main sparse attention's LSE over ``topk_indices``
+        (``(sq * b, heads)``); the loss then runs no sparse-attention forward of its own.
+        """
         _ensure_dsa_namespace()
 
         sq, b, _num_heads, _d = query.shape
@@ -5679,6 +5698,7 @@ class SparseIndexerLossFromTopKFunc(torch.autograd.Function):
             calculate_per_token_loss=calculate_per_token_loss,
             tp_group=tp_group,
             deterministic=deterministic,
+            lse=lse,
         )
 
         ctx.save_for_backward(
@@ -5704,8 +5724,8 @@ class SparseIndexerLossFromTopKFunc(torch.autograd.Function):
 
         # Grads: q_indexer, k_indexer, weights, then None for query, kv_full,
         #   topk_indices, topk_length, topk_scores, softmax_scale, loss_coeff,
-        #   calculate_per_token_loss, d_v, query_valid_rows, tp_group, deterministic.
-        gradients = (grad_q_indexer, grad_k_indexer, grad_weights) + (None,) * 12
+        #   calculate_per_token_loss, d_v, query_valid_rows, tp_group, deterministic, lse.
+        gradients = (grad_q_indexer, grad_k_indexer, grad_weights) + (None,) * 13
         return gradients[: ctx.num_inputs]
 
 
@@ -6168,6 +6188,19 @@ def _fused_absorbed_sparse_attention_decline_reason(
     return None
 
 
+def fused_absorbed_sparse_attention_decline_reason(
+    query: Tensor, key: Tensor, v_channels: int, deterministic: bool = False
+) -> Optional[str]:
+    """Why :func:`run_fused_absorbed_sparse_attention` would decline this query and key.
+
+    None when it runs, and so returns the LSE that ``return_lse=True`` asks for. Host facts
+    only: tensor metadata, never data.
+    """
+    return _fused_absorbed_sparse_attention_decline_reason(
+        query, key, v_channels, deterministic=deterministic
+    )
+
+
 def run_fused_absorbed_sparse_attention(
     query: Tensor,
     key: Tensor,
@@ -6313,6 +6346,7 @@ def fused_indexer_sparse_attn(
 
 
 __all__ = [
+    "fused_absorbed_sparse_attention_decline_reason",
     "fused_indexer_sparse_attn",
     "run_fused_absorbed_sparse_attention",
     "run_fused_dsa_attention",
